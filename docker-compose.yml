@@ -1,0 +1,29 @@
+# Mem Palace — dev compose
+# `docker compose up --build` brings up web + api with hot reload.
+# Production builds are a separate concern; this file is dev-only.
+
+services:
+  api:
+    build: ./apps/api
+    container_name: mempalace-api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./apps/api:/app                 # source bind mount (hot reload)
+      - /app/__pycache__                # don't leak host pycache in
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  web:
+    build: ./apps/web
+    container_name: mempalace-web
+    ports:
+      - "3000:3000"
+    env_file: .env
+    depends_on:
+      - api
+    volumes:
+      - ./apps/web:/app                 # source bind mount (hot reload)
+      - /app/node_modules               # anon vol: keep linux node_modules inside container
+      - /app/.next                      # anon vol: don't sync next build artifacts to host
+    command: npm run dev
