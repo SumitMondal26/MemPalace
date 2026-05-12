@@ -80,6 +80,24 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-009 — 3D force-directed canvas (react-force-graph-3d) over 2D React Flow
+
+**Date:** 2026-05-13
+
+**Context.** The "memory palace" framing wants a brain-like, organic visual. P2/P3 will explode the edge count via semantic-similarity sweeps and agent-driven linking; manual 2D layouts (React Flow) collapse under dense graphs unless we author positions, which contradicts the agent-driven future. We need a layout that scales with edge density.
+
+**Decision.** Replace the React Flow canvas with `react-force-graph-3d` (three.js under the hood). Nodes are colored emissive spheres on a dark background; semantic edges animate flowing particles to distinguish them from manual edges. Layout is emergent from edges; we do not persist positions.
+
+**Consequence.**
+- Pro: Aesthetic matches the framing — clusters become visually obvious as edges densify, exactly what P2/P3 need.
+- Pro: Force simulation scales to thousands of edges where 2D layouts thrash.
+- Pro: The same SSE/agent extension story applies — when P3 adds semantic edges, they appear as animated purple particles and the simulation pulls related nodes into spatial clusters.
+- Con: +~600 KB three.js bundle. Acceptable for a portfolio demo; would be addressed with code-splitting / route-level chunking for prod.
+- Con: We give up manual drag-to-position UX. Re-enabled in P2 with explicit "pin" feature using the still-present `nodes.x/y/z` columns.
+- Con: Mobile/touch UX is harder than 2D. Out of scope for P1.
+
+---
+
 ## ADR-008 — Every node's content is embedded, not just uploaded files
 
 **Date:** 2026-05-13

@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import ChatPanel from "@/components/ChatPanel";
 import GraphCanvas from "@/components/GraphCanvas";
@@ -32,7 +32,11 @@ export default function GraphPageClient({
   const setInitial = useGraphStore((s) => s.setInitial);
   const upsertNode = useGraphStore((s) => s.upsertNode);
   const selectNode = useGraphStore((s) => s.selectNode);
+  const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
   const nodeCount = useGraphStore((s) => s.nodes.length);
+
+  const [showGrid, setShowGrid] = useState(false);
+  const [fitTrigger, setFitTrigger] = useState(0);
 
   useEffect(() => {
     setInitial({
@@ -47,11 +51,16 @@ export default function GraphPageClient({
       const node = await db.createNode({
         workspace_id: workspaceId,
         type,
-        title: type === "note" ? "New thought" : type === "doc" ? "New doc" : "New URL",
+        title:
+          type === "note"
+            ? "New thought"
+            : type === "doc"
+              ? "New doc"
+              : "New URL",
         content: "",
-        // scatter new nodes so they don't all stack
-        x: 80 + Math.random() * 360,
-        y: 80 + Math.random() * 260,
+        // Positions are ignored by the 3D canvas (force-directed). Any value is fine.
+        x: 0,
+        y: 0,
       });
       upsertNode(node);
       selectNode(node.id);
@@ -66,9 +75,17 @@ export default function GraphPageClient({
     router.refresh();
   }
 
+  const sidebarOpen = !!selectedNodeId;
+
   return (
-    <div className="grid h-screen grid-cols-[1fr_340px] grid-rows-[auto_1fr]">
-      <header className="col-span-2 flex items-center justify-between border-b border-palace-edge bg-palace-bg/80 px-6 py-3 backdrop-blur">
+    <div className="relative h-screen w-screen overflow-hidden bg-palace-bg">
+      {/* Canvas — fills the entire viewport */}
+      <div className="absolute inset-0">
+        <GraphCanvas showGrid={showGrid} fitTrigger={fitTrigger} />
+      </div>
+
+      {/* Floating header with workspace + add-node + sign-out */}
+      <header className="absolute left-0 right-0 top-0 z-20 flex items-center justify-between border-b border-palace-edge/60 bg-palace-bg/70 px-6 py-3 backdrop-blur-md">
         <div>
           <h1 className="text-base font-semibold">{workspaceName}</h1>
           <p className="text-xs text-neutral-500">
@@ -94,11 +111,37 @@ export default function GraphPageClient({
         </div>
       </header>
 
-      <main className="relative">
-        <GraphCanvas />
-      </main>
+      {/* Canvas controls — top-right under the header */}
+      <div className="absolute right-6 top-20 z-10 flex flex-col gap-2">
+        <label className="flex cursor-pointer items-center gap-2 rounded-lg bg-palace-panel/80 px-3 py-1.5 text-xs text-neutral-300 ring-1 ring-palace-edge backdrop-blur hover:bg-palace-panel">
+          <input
+            type="checkbox"
+            checked={showGrid}
+            onChange={(e) => setShowGrid(e.target.checked)}
+            className="accent-palace-accent"
+          />
+          Floor grid
+        </label>
+        <button
+          onClick={() => setFitTrigger((c) => c + 1)}
+          className="rounded-lg bg-palace-panel/80 px-3 py-1.5 text-xs text-neutral-300 ring-1 ring-palace-edge backdrop-blur hover:bg-palace-panel"
+          title="Recenter and zoom to fit all nodes"
+        >
+          Fit view
+        </button>
+      </div>
 
-      <Sidebar />
+      {/* Sidebar — slides in from the right when a node is selected */}
+      <div
+        className={`absolute right-0 top-0 z-30 h-screen w-[380px] transform transition-transform duration-300 ease-out ${
+          sidebarOpen ? "translate-x-0" : "translate-x-full"
+        }`}
+        aria-hidden={!sidebarOpen}
+      >
+        <Sidebar />
+      </div>
+
+      {/* Chat — bottom-left fixed */}
       <ChatPanel />
     </div>
   );

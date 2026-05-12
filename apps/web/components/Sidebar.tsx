@@ -155,7 +155,7 @@ export default function Sidebar() {
   const hasContent = content.trim().length > 0;
 
   return (
-    <aside className="flex h-full flex-col border-l border-palace-edge bg-palace-panel/50">
+    <aside className="flex h-full flex-col border-l border-palace-edge bg-palace-panel/95 shadow-2xl backdrop-blur-md">
       <header className="border-b border-palace-edge p-4">
         <div className="flex items-center justify-between">
           <div className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">

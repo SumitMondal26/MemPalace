@@ -1,155 +1,302 @@
 "use client";
 
-import {
-  Background,
-  Controls,
-  MiniMap,
-  ReactFlow,
-  useEdgesState,
-  useNodesState,
-  type Connection,
-  type Edge as RFEdge,
-  type Node as RFNode,
-  type NodeTypes,
-} from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
+import dynamic from "next/dynamic";
+import { useEffect, useMemo, useRef, useState } from "react";
+import * as THREE from "three";
 
-import { useCallback, useEffect } from "react";
-
-import * as db from "@/lib/db";
 import { useGraphStore } from "@/lib/store";
-import NodeCard, { type CardNode } from "./NodeCard";
 
-const nodeTypes: NodeTypes = { card: NodeCard };
+/**
+ * 3D force-directed canvas — the memory-palace view.
+ *
+ * Notes:
+ *  - Width/height are explicitly bound to the parent via ResizeObserver. Without
+ *    this, react-force-graph defaults to window.innerWidth/Height and paints
+ *    *over* the floating header.
+ *  - Ambient particle field added to the scene for atmosphere.
+ *  - Optional floor grid (Maya/Blender-style) for spatial reference.
+ *  - Three.js can't SSR — we dynamic-import with ssr:false.
+ */
 
-function toRFNode(n: db.DbNode): RFNode {
-  return {
-    id: n.id,
-    type: "card",
-    position: { x: n.x, y: n.y },
-    data: { title: n.title, type: n.type, content: n.content },
-  } as CardNode;
-}
+const ForceGraph3D = dynamic(() => import("react-force-graph-3d"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex h-full w-full items-center justify-center text-sm text-neutral-500">
+      Spinning up your palace…
+    </div>
+  ),
+});
 
-function toRFEdge(e: db.DbEdge): RFEdge {
-  return {
-    id: e.id,
-    source: e.source_id,
-    target: e.target_id,
-    animated: e.kind === "semantic",
-    style: e.kind === "semantic" ? { stroke: "#7c5cff" } : undefined,
-  };
-}
+const TYPE_COLOR: Record<string, string> = {
+  note: "#22d3ee",
+  doc: "#fbbf24",
+  url: "#f472b6",
+  cluster: "#a78bfa",
+};
+const FALLBACK_COLOR = "#7c5cff";
+const SELECTED_COLOR = "#ffffff";
 
-export default function GraphCanvas() {
-  const workspaceId = useGraphStore((s) => s.workspaceId);
+type GNode = { id: string; type: string; title: string | null };
+type GLink = { source: string; target: string; kind: "manual" | "semantic" };
+
+type FGRef = {
+  scene?: () => THREE.Scene;
+  camera?: () => THREE.PerspectiveCamera;
+  zoomToFit?: (duration?: number, padding?: number) => void;
+};
+
+export default function GraphCanvas({
+  showGrid,
+  fitTrigger,
+}: {
+  showGrid: boolean;
+  /** Increment to re-run zoom-to-fit imperatively from the parent. */
+  fitTrigger: number;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const fgRef = useRef<FGRef | null>(null);
+  const [size, setSize] = useState({ width: 800, height: 600 });
+
   const dbNodes = useGraphStore((s) => s.nodes);
   const dbEdges = useGraphStore((s) => s.edges);
   const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
-  const upsertNode = useGraphStore((s) => s.upsertNode);
-  const upsertEdge = useGraphStore((s) => s.upsertEdge);
-  const removeEdge = useGraphStore((s) => s.removeEdge);
   const selectNode = useGraphStore((s) => s.selectNode);
 
-  // React Flow's local node/edge state. Resync whenever the store changes.
-  // This split lets RF own smooth drag updates while DB stays the truth.
-  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<RFNode>([]);
-  const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<RFEdge>([]);
-
+  // Keep the canvas sized to its parent (fixes the "canvas covers header" bug).
   useEffect(() => {
-    setRfNodes(
-      dbNodes.map((n) => ({
-        ...toRFNode(n),
-        selected: n.id === selectedNodeId,
+    if (!containerRef.current) return;
+    const update = () => {
+      if (!containerRef.current) return;
+      const r = containerRef.current.getBoundingClientRect();
+      setSize({ width: r.width, height: r.height });
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  // Ambient particle field — slow drift around the graph.
+  useEffect(() => {
+    let frame: number | null = null;
+    let points: THREE.Points | null = null;
+    let geo: THREE.BufferGeometry | null = null;
+    let mat: THREE.PointsMaterial | null = null;
+
+    const tryAttach = () => {
+      const scene = fgRef.current?.scene?.();
+      if (!scene) return false;
+
+      const count = 900;
+      const positions = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        // Sphere shell, roughly r ∈ [250, 950]
+        const r = 250 + Math.random() * 700;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+        positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+        positions[i * 3 + 2] = r * Math.cos(phi);
+      }
+      geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      mat = new THREE.PointsMaterial({
+        color: 0x7c5cff,
+        size: 1.6,
+        transparent: true,
+        opacity: 0.35,
+        sizeAttenuation: true,
+        depthWrite: false,
+      });
+      points = new THREE.Points(geo, mat);
+      scene.add(points);
+
+      let t = 0;
+      const tick = () => {
+        t += 0.0003;
+        if (points) {
+          points.rotation.y = t;
+          points.rotation.x = t * 0.4;
+        }
+        frame = requestAnimationFrame(tick);
+      };
+      tick();
+      return true;
+    };
+
+    // Poll until the force-graph ref is mounted (~100-300ms after mount).
+    const wait = setInterval(() => {
+      if (tryAttach()) clearInterval(wait);
+    }, 100);
+
+    return () => {
+      clearInterval(wait);
+      if (frame) cancelAnimationFrame(frame);
+      if (points) fgRef.current?.scene?.()?.remove(points);
+      geo?.dispose();
+      mat?.dispose();
+    };
+  }, []);
+
+  // Continuous floating motion via the per-frame nodePositionUpdate callback
+  // (passed to ForceGraph3D below). This is purely visual — we offset each
+  // node's three.js position around its layout position with its own phase
+  // and frequency so they don't oscillate in lockstep.
+  //
+  // Why this approach over a custom d3 force:
+  // next/dynamic wraps the component and the lib's imperative ref methods
+  // (d3Force / d3AlphaDecay / etc.) don't reliably forward through the
+  // wrapper. The per-frame prop callback, on the other hand, definitely runs.
+
+  // Optional floor grid (Maya/Blender vibe).
+  useEffect(() => {
+    if (!showGrid) return;
+    let grid: THREE.GridHelper | null = null;
+
+    const wait = setInterval(() => {
+      const scene = fgRef.current?.scene?.();
+      if (!scene) return;
+      clearInterval(wait);
+      grid = new THREE.GridHelper(3000, 60, 0x7c5cff, 0x2a2d3f);
+      grid.position.y = -260;
+      const m = grid.material as THREE.Material;
+      m.transparent = true;
+      m.opacity = 0.4;
+      scene.add(grid);
+    }, 100);
+
+    return () => {
+      clearInterval(wait);
+      if (grid) {
+        fgRef.current?.scene?.()?.remove(grid);
+        grid.geometry.dispose();
+        const m = grid.material as THREE.Material | THREE.Material[];
+        Array.isArray(m) ? m.forEach((mm) => mm.dispose()) : m.dispose();
+      }
+    };
+  }, [showGrid]);
+
+  const data = useMemo(
+    () => ({
+      nodes: dbNodes.map<GNode>((n) => ({
+        id: n.id,
+        type: n.type,
+        title: n.title,
       })),
-    );
-  }, [dbNodes, selectedNodeId, setRfNodes]);
+      links: dbEdges.map<GLink>((e) => ({
+        source: e.source_id,
+        target: e.target_id,
+        kind: e.kind,
+      })),
+    }),
+    [dbNodes, dbEdges],
+  );
 
+  // Auto-fit once the simulation has settled. Generous padding so small
+  // graphs don't end up jammed against the camera.
   useEffect(() => {
-    setRfEdges(dbEdges.map(toRFEdge));
-  }, [dbEdges, setRfEdges]);
+    if (dbNodes.length === 0) return;
+    const t = setTimeout(() => fgRef.current?.zoomToFit?.(600, 400), 800);
+    return () => clearTimeout(t);
+  }, [dbNodes.length]);
 
-  const onNodeDragStop = useCallback(
-    async (_: unknown, node: RFNode) => {
-      try {
-        const updated = await db.updateNode(node.id, {
-          x: node.position.x,
-          y: node.position.y,
-        });
-        upsertNode(updated);
-      } catch (e) {
-        console.error("persist position failed", e);
-      }
-    },
-    [upsertNode],
-  );
-
-  const onConnect = useCallback(
-    async (conn: Connection) => {
-      if (!workspaceId || !conn.source || !conn.target) return;
-      if (conn.source === conn.target) return; // no self-loops in P1
-      try {
-        const edge = await db.createEdge({
-          workspace_id: workspaceId,
-          source_id: conn.source,
-          target_id: conn.target,
-        });
-        upsertEdge(edge);
-      } catch (e) {
-        console.error("createEdge failed", e);
-      }
-    },
-    [workspaceId, upsertEdge],
-  );
-
-  const onEdgesDelete = useCallback(
-    async (edges: RFEdge[]) => {
-      await Promise.all(
-        edges.map(async (e) => {
-          try {
-            await db.deleteEdge(e.id);
-            removeEdge(e.id);
-          } catch (err) {
-            console.error("deleteEdge failed", err);
-          }
-        }),
-      );
-    },
-    [removeEdge],
-  );
-
-  const onNodeClick = useCallback(
-    (_: unknown, node: RFNode) => selectNode(node.id),
-    [selectNode],
-  );
-
-  const onPaneClick = useCallback(() => selectNode(null), [selectNode]);
+  // Imperative "Fit view" — bumped by the parent button.
+  useEffect(() => {
+    if (fitTrigger <= 0) return;
+    fgRef.current?.zoomToFit?.(500, 400);
+  }, [fitTrigger]);
 
   return (
-    <ReactFlow
-      nodes={rfNodes}
-      edges={rfEdges}
-      onNodesChange={onNodesChange}
-      onEdgesChange={onEdgesChange}
-      onNodeDragStop={onNodeDragStop}
-      onConnect={onConnect}
-      onEdgesDelete={onEdgesDelete}
-      onNodeClick={onNodeClick}
-      onPaneClick={onPaneClick}
-      nodeTypes={nodeTypes}
-      colorMode="dark"
-      fitView
-      proOptions={{ hideAttribution: true }}
-    >
-      <Background gap={24} size={1} color="#1f2030" />
-      <Controls position="bottom-right" />
-      <MiniMap
-        pannable
-        zoomable
-        className="!bg-palace-panel"
-        nodeColor={(n) => (n.selected ? "#7c5cff" : "#3b3d52")}
-        maskColor="rgba(10, 10, 15, 0.7)"
+    <div ref={containerRef} className="h-full w-full">
+      {/* @ts-expect-error - dynamic-imported component types don't carry through cleanly */}
+      <ForceGraph3D
+        ref={fgRef}
+        graphData={data}
+        width={size.width}
+        height={size.height}
+        backgroundColor="#0a0a0f"
+        nodeRelSize={6}
+        nodeOpacity={0.9}
+        nodeResolution={20}
+        nodeVal={(n: GNode) => (n.id === selectedNodeId ? 12 : 6)}
+        nodeColor={(n: GNode) =>
+          n.id === selectedNodeId
+            ? SELECTED_COLOR
+            : (TYPE_COLOR[n.type] ?? FALLBACK_COLOR)
+        }
+        nodeLabel={(n: GNode) =>
+          `<div style="background:rgba(17,18,26,0.95);color:#e5e5e5;padding:6px 10px;border-radius:6px;font-size:11px;border:1px solid #2a2d3f;box-shadow:0 4px 12px rgba(0,0,0,0.5);">` +
+          `<div style="opacity:0.6;text-transform:uppercase;letter-spacing:0.05em;font-size:9px;color:${TYPE_COLOR[n.type] ?? FALLBACK_COLOR}">${n.type}</div>` +
+          `<div style="margin-top:2px">${escapeHtml(n.title || "Untitled")}</div>` +
+          `</div>`
+        }
+        linkColor={(l: GLink) => (l.kind === "semantic" ? "#7c5cff" : "#3b3d52")}
+        linkWidth={(l: GLink) => (l.kind === "semantic" ? 0.8 : 0.4)}
+        linkOpacity={0.55}
+        linkDirectionalParticles={(l: GLink) => (l.kind === "semantic" ? 3 : 0)}
+        linkDirectionalParticleSpeed={0.006}
+        linkDirectionalParticleWidth={2}
+        linkDirectionalParticleColor={() => "#a78bfa"}
+        onNodeClick={(n: GNode) => selectNode(n.id)}
+        onBackgroundClick={() => selectNode(null)}
+        enableNodeDrag={true}
+        controlType="orbit"
+        cooldownTicks={200}
+        warmupTicks={50}
+        nodePositionUpdate={(
+          nodeObj: { position: { set: (x: number, y: number, z: number) => void } },
+          _coords: { x: number; y: number; z: number },
+          node: GNode & {
+            __phase?: number;
+            __freq?: number;
+            x?: number;
+            y?: number;
+            z?: number;
+            fx?: number | null;
+            fy?: number | null;
+            fz?: number | null;
+          },
+        ) => {
+          // While the user is dragging, the lib pins via fx/fy/fz. Honor that.
+          if (node.fx != null && node.fy != null && node.fz != null) {
+            nodeObj.position.set(node.fx, node.fy, node.fz);
+            return true;
+          }
+
+          // First time we see this node, give it a unique oscillation.
+          if (node.__phase == null) {
+            node.__phase = Math.random() * Math.PI * 2;
+            node.__freq = 0.25 + Math.random() * 0.35;
+          }
+
+          // node.x/y/z is the *data* position written by the d3-force sim.
+          // It's stable after cooldown — using it as the orbit center avoids
+          // the feedback loop where `coords` (the lib's previous output)
+          // accumulates our offset every frame.
+          const baseX = node.x ?? 0;
+          const baseY = node.y ?? 0;
+          const baseZ = node.z ?? 0;
+
+          const t = performance.now() / 1000;
+          const amp = 8;
+
+          nodeObj.position.set(
+            baseX + Math.sin(t * node.__freq! + node.__phase) * amp,
+            baseY + Math.cos(t * node.__freq! * 1.1 + node.__phase) * amp,
+            baseZ + Math.sin(t * node.__freq! * 0.9 + node.__phase * 1.5) * amp,
+          );
+          return true;
+        }}
       />
-    </ReactFlow>
+    </div>
   );
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
