@@ -10,6 +10,7 @@ from .routers import chat as chat_router
 from .routers import ingest as ingest_router
 from .routers import me as me_router
 from .routers import nodes as nodes_router
+from .routers import workspaces as workspaces_router
 
 
 @asynccontextmanager
@@ -36,4 +37,5 @@ async def health() -> dict[str, str]:
 app.include_router(me_router.router, tags=["me"])
 app.include_router(ingest_router.router, tags=["ingest"])
 app.include_router(nodes_router.router, tags=["nodes"])
+app.include_router(workspaces_router.router, tags=["workspaces"])
 app.include_router(chat_router.router, tags=["chat"])

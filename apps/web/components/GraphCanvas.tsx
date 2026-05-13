@@ -192,19 +192,24 @@ export default function GraphCanvas({
     [dbNodes, dbEdges],
   );
 
-  // Auto-fit once the simulation has settled. Generous padding so small
-  // graphs don't end up jammed against the camera.
+  // Padding in pixels controls how much empty margin sits around the
+  // bounding box of all nodes. Smaller = tighter zoom. We aim for ~70%
+  // cluster fill: 15% empty on each side of the smaller viewport dim.
+  // Min 40px so tiny viewports don't crop the spheres against the edge.
+  const fitPadding = Math.max(40, Math.min(size.width, size.height) * 0.15);
+
+  // Auto-fit once the simulation has settled.
   useEffect(() => {
     if (dbNodes.length === 0) return;
-    const t = setTimeout(() => fgRef.current?.zoomToFit?.(600, 400), 800);
+    const t = setTimeout(() => fgRef.current?.zoomToFit?.(600, fitPadding), 800);
     return () => clearTimeout(t);
-  }, [dbNodes.length]);
+  }, [dbNodes.length, fitPadding]);
 
   // Imperative "Fit view" — bumped by the parent button.
   useEffect(() => {
     if (fitTrigger <= 0) return;
-    fgRef.current?.zoomToFit?.(500, 400);
-  }, [fitTrigger]);
+    fgRef.current?.zoomToFit?.(500, fitPadding);
+  }, [fitTrigger, fitPadding]);
 
   return (
     <div ref={containerRef} className="h-full w-full">
@@ -256,6 +261,10 @@ export default function GraphCanvas({
           node: GNode & {
             __phase?: number;
             __freq?: number;
+            __initTime?: number;
+            __baseX?: number;
+            __baseY?: number;
+            __baseZ?: number;
             x?: number;
             y?: number;
             z?: number;
@@ -268,37 +277,62 @@ export default function GraphCanvas({
             // While the user is dragging, the lib pins via fx/fy/fz. Honor that.
             if (node.fx != null && node.fy != null && node.fz != null) {
               nodeObj.position.set(node.fx, node.fy, node.fz);
+              node.__baseX = node.fx;
+              node.__baseY = node.fy;
+              node.__baseZ = node.fz;
               return true;
             }
 
-            // Initialize oscillation params once per node. Safe defaults so
-            // we never compute Math.sin(NaN) which would produce a NaN
-            // position that three.js complains about.
-            const phase = node.__phase ?? (node.__phase = Math.random() * Math.PI * 2);
-            const freq = node.__freq ?? (node.__freq = 0.25 + Math.random() * 0.35);
+            // Initialize once per node. Defaults guard against NaN.
+            if (node.__phase == null) {
+              node.__phase = Math.random() * Math.PI * 2;
+              node.__freq = 0.25 + Math.random() * 0.35;
+              node.__initTime = performance.now();
+            }
+            const phase = node.__phase;
+            const freq = node.__freq ?? 0.4;
 
-            const baseX = Number.isFinite(node.x) ? (node.x as number) : 0;
-            const baseY = Number.isFinite(node.y) ? (node.y as number) : 0;
-            const baseZ = Number.isFinite(node.z) ? (node.z as number) : 0;
+            const now = performance.now();
+            const elapsed = now - (node.__initTime ?? now);
 
-            const t = performance.now() / 1000;
+            // 1.5s warmup: follow whatever the d3 sim places. During this
+            // window we track the current sim position as the orbit center
+            // so it ends up at the right spot when oscillation kicks in.
+            if (elapsed < 1500) {
+              const sx = Number.isFinite(node.x) ? (node.x as number) : 0;
+              const sy = Number.isFinite(node.y) ? (node.y as number) : 0;
+              const sz = Number.isFinite(node.z) ? (node.z as number) : 0;
+              node.__baseX = sx;
+              node.__baseY = sy;
+              node.__baseZ = sz;
+              nodeObj.position.set(sx, sy, sz);
+              return true;
+            }
+
+            // After warmup: oscillate around locked base, and crucially
+            // write the same value back to node.x/y/z so edges follow the
+            // sphere instead of attaching to the orbit center.
+            const baseX = node.__baseX ?? 0;
+            const baseY = node.__baseY ?? 0;
+            const baseZ = node.__baseZ ?? 0;
+            const t = now / 1000;
             const amp = 8;
 
             const x = baseX + Math.sin(t * freq + phase) * amp;
             const y = baseY + Math.cos(t * freq * 1.1 + phase) * amp;
             const z = baseZ + Math.sin(t * freq * 0.9 + phase * 1.5) * amp;
 
-            // Final NaN guard — if anything upstream went sideways, fall back
-            // to the data position instead of writing NaN into three.js.
-            nodeObj.position.set(
-              Number.isFinite(x) ? x : baseX,
-              Number.isFinite(y) ? y : baseY,
-              Number.isFinite(z) ? z : baseZ,
-            );
+            const fx = Number.isFinite(x) ? x : baseX;
+            const fy = Number.isFinite(y) ? y : baseY;
+            const fz = Number.isFinite(z) ? z : baseZ;
+            nodeObj.position.set(fx, fy, fz);
+            // The data position now matches the visual position, so the
+            // lib's link drawing connects to the actual sphere center.
+            node.x = fx;
+            node.y = fy;
+            node.z = fz;
             return true;
           } catch {
-            // Never throw from a per-frame callback — that would spam the
-            // dev overlay every animation tick.
             return false;
           }
         }}

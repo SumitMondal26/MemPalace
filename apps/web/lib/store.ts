@@ -31,6 +31,7 @@ type Actions = {
   removeNode: (id: string) => void;
   upsertEdge: (e: DbEdge) => void;
   removeEdge: (id: string) => void;
+  setEdges: (edges: DbEdge[]) => void;
   selectNode: (id: string | null) => void;
 };
 
@@ -74,6 +75,8 @@ export const useGraphStore = create<State & Actions>((set) => ({
 
   removeEdge: (id) =>
     set((s) => ({ edges: s.edges.filter((e) => e.id !== id) })),
+
+  setEdges: (edges) => set({ edges }),
 
   selectNode: (id) => set({ selectedNodeId: id }),
 }));

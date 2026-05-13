@@ -80,6 +80,25 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-010 — Semantic edges via pairwise cosine on node-mean embeddings
+
+**Date:** 2026-05-14
+
+**Context.** The thesis of Mem Palace is "memory as a graph that organizes itself." P1 shipped with only manual edges — the user clicks-and-drags to connect nodes. Until that vision shows up visually, the project is a 3D React Flow with chat bolted on. We need agent-like graph behavior, starting somewhere.
+
+**Decision.** A SQL function `rebuild_semantic_edges(ws_id, threshold)` computes the mean chunk-embedding per node (`avg(c.embedding)` from pgvector 0.7+), pairwise cosine similarity over all node pairs in the workspace (`1 - (a.embedding <=> b.embedding)`), and inserts edges with `kind='semantic'` and `weight=similarity` for pairs above threshold (default 0.65). The endpoint `POST /workspaces/{id}/rebuild-edges` triggers it; a "✨ Auto-connect" UI button in the canvas calls the endpoint and refetches edges. Idempotent — re-runs delete previous semantic edges first.
+
+**Consequence.**
+- Pro: Agent-shaped behavior with zero ML novelty — pure linear algebra over what we already have.
+- Pro: All in SQL — one round-trip, scales to thousands of nodes via pgvector ops, no Python numpy needed.
+- Pro: Cleanly separated from manual edges (different `kind`); they coexist, manual stays untouched.
+- Pro: The 3D canvas already styles semantic edges with animated purple particles, so the visual upgrade is free.
+- Con: Mean-of-chunks per node is a coarse representation. A long doc whose mean lies in "general AI paper" space won't connect to a specific question about attention even if a single chunk perfectly matches. P2 upgrade: "best-pair-chunk" similarity (max over chunk-pair cartesian product) or a small LLM-judge for borderline pairs.
+- Con: Threshold 0.65 is a guess. Without evals (yet), we can't say if it produces too many spurious edges or misses real ones. To be tuned when the eval harness lands.
+- Con: Runs synchronously over the request (~50-500ms for small workspaces). Past ~1000 nodes, move behind a Redis queue in P2.
+
+---
+
 ## ADR-009 — 3D force-directed canvas (react-force-graph-3d) over 2D React Flow
 
 **Date:** 2026-05-13

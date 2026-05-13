@@ -53,6 +53,30 @@ This means *every* memory ends up in the `chunks` table, behind the same `match_
 
 ---
 
+## Semantic edges (auto-connect)
+
+The "✨ Auto-connect" button triggers `POST /workspaces/{id}/rebuild-edges` → SQL function `rebuild_semantic_edges`:
+
+1. Compute mean(chunk.embedding) per node (pgvector `avg(vector)` aggregate).
+2. Pairwise cosine: `1 - (a.embedding <=> b.embedding)` for every node pair.
+3. Insert `kind='semantic'` edges for pairs above threshold (0.65 default).
+4. Idempotent — clears existing semantic edges before inserting fresh ones.
+
+The 3D canvas renders semantic edges with animated purple particles flowing source→target — visually distinct from grey manual edges. Force-directed layout pulls semantically-similar nodes into spatial clusters automatically.
+
+**Coarse-but-fast representation.** "Node-mean embedding" is the simplest viable summary of a node. It works well for notes (1 chunk = the chunk's own vector) and short docs. For long docs whose mean lies in a "general topic" zone, it can miss connections where a single chunk is a very specific match. P2 upgrade path: `best-pair-chunk` similarity (max over chunk-pair Cartesian product) or LLM-judge for borderline pairs.
+
+**Threshold tuning — empirically anchored at 0.4.** Iteration on real data:
+- `0.65` (theory): produced 0 edges. Too strict for short text.
+- `0.50`: caught only the very strongest pair (`sumit` ↔ `sumit's age` @ 0.617).
+- `0.40`: catches related entities like `Eijuuu (sumit's gf)` ↔ `sumit` @ 0.427.
+
+The lesson: short notes + node-mean embedding → similarities cluster 0.3–0.7, not the 0.8+ you see from paragraph-length chunks. **0.4 is the realistic floor** without an LLM-rerank pass; below that you start linking unrelated pairs that just share sentence templates ("X is N years old" matches itself across entities). Long-doc workspaces could go higher (~0.55) once P2 best-pair-chunk lands.
+
+**Why pure embedding similarity has a ceiling on short text:** embedding-based similarity weighs surface form (token overlap, sentence structure) alongside semantic content, inseparably. Two short sentences about the same entity in different structures (`"my name is sumit"` vs `"sumit's girlfriend is X"`) score lower than two short sentences with the same template about different entities (`"X is N years old"` vs `"Y is M years old"`). Real fix is reranking with an LLM that understands entities — P3 work.
+
+---
+
 ## Retrieval (P1)
 
 ```
