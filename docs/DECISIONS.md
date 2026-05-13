@@ -80,6 +80,28 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-011 — Retrieval evals: standalone Python script + JSON golden set
+
+**Date:** 2026-05-14
+
+**Context.** P1 + semantic edges shipped with no way to measure retrieval quality. Every threshold and chunking decision was a guess validated by eyeballing the chat panel. The same pattern is about to repeat as we plan graph-augmented retrieval and best-pair-chunk — without numbers, we can't tell if changes help, regress, or do nothing.
+
+**Decision.** A standalone script `apps/api/eval/run_evals.py` reads a hand-curated JSON golden set (`golden.json`) of (question, expected_node_titles) cases. For each case it embeds the question with the production OpenAI model, calls the production `match_chunks` RPC against the production Supabase, maps returned chunks to node titles, and records the first rank where an expected node appears. Aggregates: recall@1, recall@3, recall@5, recall@10, MRR. Failure list at the bottom for failed cases. `make evals` is the entry point.
+
+The script uses the service-role key (bypasses RLS) and direct stdlib `urllib`/`json` — no python deps required, no FastAPI start needed.
+
+**Consequence.**
+- Pro: Every future retrieval change becomes measurable. Built once, used forever.
+- Pro: Failure list reveals patterns (false friends, low-confidence matches, wrong-node-high-sim) without needing tracing infrastructure.
+- Pro: Zero-dependency stdlib script means anyone can clone the repo, fill `.env`, and `make evals`.
+- Con: Tests retrieval in isolation — auth, RLS, FastAPI middleware, and full /chat composition aren't measured. Those need their own tests later.
+- Con: No faithfulness or answer-quality metrics yet (LLM-as-judge is P3 work). recall@k tells you "did we find the right chunk?", not "did the model use it correctly."
+- Con: Golden set quality is human-bottlenecked. Bad cases produce misleading numbers. Convention: cases must come from real user phrasings, not engineered to pass.
+
+**Path:** P2 expands cases as more memory is added; P3 adds LLM-judge faithfulness; P4 wires evals into CI to gate retrieval changes.
+
+---
+
 ## ADR-010 — Semantic edges via pairwise cosine on node-mean embeddings
 
 **Date:** 2026-05-14

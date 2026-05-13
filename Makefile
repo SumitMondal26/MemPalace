@@ -1,4 +1,4 @@
-.PHONY: dev down logs build rebuild fmt lint migrate seed health help
+.PHONY: dev down logs build rebuild fmt lint migrate seed health evals help
 
 help:
 	@echo "Mem Palace — common commands"
@@ -11,6 +11,7 @@ help:
 	@echo "  make health     Curl both health endpoints"
 	@echo "  make migrate    Apply supabase/migrations/* to the linked project"
 	@echo "  make seed       Apply supabase/seed.sql"
+	@echo "  make evals      Run retrieval evals (recall@k + MRR over golden set)"
 	@echo "  make fmt        Format api (ruff) + web (biome/prettier)"
 	@echo "  make lint       Lint api + web"
 
@@ -38,6 +39,9 @@ migrate:
 
 seed:
 	supabase db reset --linked  # destructive: only for dev resets
+
+evals:
+	@python3 apps/api/eval/run_evals.py
 
 fmt:
 	cd apps/api && ruff format .

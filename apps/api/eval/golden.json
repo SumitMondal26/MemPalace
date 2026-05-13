@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "description": "Mem Palace retrieval evaluation set. Each case is a question whose answer should come from at least one of the listed expected_node_titles. Add cases over time as you ingest more memory.",
+  "k_max": 10,
+  "cases": [
+    {
+      "id": "personal-name",
+      "question": "what is my name?",
+      "expected_node_titles": ["sumit"],
+      "notes": "Direct lookup; should be top-1."
+    },
+    {
+      "id": "personal-age",
+      "question": "how old am I?",
+      "expected_node_titles": ["sumit's age"],
+      "notes": "Direct lookup; competes with 'Eijjuu is 25 years old' which has the same template."
+    },
+    {
+      "id": "personal-relationship",
+      "question": "who is my girlfriend?",
+      "expected_node_titles": ["Eijuuu"],
+      "notes": "Direct lookup; the word 'girlfriend' appears in the chunk."
+    },
+    {
+      "id": "personal-relationship-japanese",
+      "question": "who is my kenojo?",
+      "expected_node_titles": ["Eijuuu"],
+      "notes": "Same as above but with the romaji term 'kenojo'. Tests low-resource word handling."
+    },
+    {
+      "id": "paper-multi-head-attention",
+      "question": "what is multi-head attention?",
+      "expected_node_titles": ["book"],
+      "notes": "Concept lookup in the Transformer paper."
+    },
+    {
+      "id": "paper-architecture",
+      "question": "what model architecture does this paper introduce?",
+      "expected_node_titles": ["book"],
+      "notes": "Should retrieve a paper chunk; abstract or model section."
+    },
+    {
+      "id": "paper-attention-mechanism",
+      "question": "how does scaled dot-product attention work?",
+      "expected_node_titles": ["book"],
+      "notes": "Specific concept that lives in a known section of the paper."
+    },
+    {
+      "id": "paper-positional-encoding",
+      "question": "why use positional encoding in transformers?",
+      "expected_node_titles": ["book"],
+      "notes": "Tests whether retrieval finds the positional-encoding section."
+    }
+  ]
+}
