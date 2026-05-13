@@ -35,9 +35,31 @@ const TYPE_COLOR: Record<string, string> = {
 };
 const FALLBACK_COLOR = "#7c5cff";
 const SELECTED_COLOR = "#ffffff";
+const MANUAL_EDGE_COLOR = "#3b3d52";
+
+/**
+ * Smooth color gradient for semantic edges based on weight (cosine similarity).
+ * - 0.25 (just above floor): dim cool-purple, almost background
+ * - 0.45: brand purple
+ * - 0.65+: bright electric magenta-purple
+ *
+ * Lets the eye read edge strength at a glance without filtering anything out.
+ */
+function semanticEdgeColor(weight: number): string {
+  const t = Math.max(0, Math.min(1, (weight - 0.25) / 0.45));
+  const h = 260 + t * 30;       // deep blue-purple → pink-magenta
+  const s = 35 + t * 50;        // muted → saturated
+  const l = 38 + t * 27;        // dim → bright
+  return `hsl(${h.toFixed(0)}, ${s.toFixed(0)}%, ${l.toFixed(0)}%)`;
+}
 
 type GNode = { id: string; type: string; title: string | null };
-type GLink = { source: string; target: string; kind: "manual" | "semantic" };
+type GLink = {
+  source: string;
+  target: string;
+  kind: "manual" | "semantic";
+  weight: number;
+};
 
 type FGRef = {
   scene?: () => THREE.Scene;
@@ -187,6 +209,7 @@ export default function GraphCanvas({
         source: e.source_id,
         target: e.target_id,
         kind: e.kind,
+        weight: e.weight ?? 0.5,
       })),
     }),
     [dbNodes, dbEdges],
@@ -235,13 +258,33 @@ export default function GraphCanvas({
           `<div style="margin-top:2px">${escapeHtml(n.title || "Untitled")}</div>` +
           `</div>`
         }
-        linkColor={(l: GLink) => (l.kind === "semantic" ? "#7c5cff" : "#3b3d52")}
-        linkWidth={(l: GLink) => (l.kind === "semantic" ? 0.8 : 0.4)}
-        linkOpacity={0.55}
-        linkDirectionalParticles={(l: GLink) => (l.kind === "semantic" ? 3 : 0)}
+        // Weight-modulated rendering: stronger semantic edges look stronger.
+        // Color gradient (cool-dim → bright-magenta) for instant strength
+        // readability; width/opacity/particles also scale with weight.
+        // Manual edges keep a flat dim appearance.
+        linkColor={(l: GLink) =>
+          l.kind === "semantic"
+            ? semanticEdgeColor(l.weight)
+            : MANUAL_EDGE_COLOR
+        }
+        linkWidth={(l: GLink) =>
+          l.kind === "semantic"
+            ? 0.3 + Math.max(0, l.weight - 0.2) * 2.2
+            : 0.4
+        }
+        linkOpacity={0.75}
+        linkDirectionalParticles={(l: GLink) =>
+          l.kind === "semantic" && l.weight >= 0.35
+            ? Math.min(4, Math.ceil((l.weight - 0.2) * 5))
+            : 0
+        }
         linkDirectionalParticleSpeed={0.006}
-        linkDirectionalParticleWidth={2}
-        linkDirectionalParticleColor={() => "#a78bfa"}
+        linkDirectionalParticleWidth={(l: GLink) =>
+          l.kind === "semantic" ? 1.2 + l.weight * 1.5 : 1.5
+        }
+        linkDirectionalParticleColor={(l: GLink) =>
+          l.kind === "semantic" ? semanticEdgeColor(l.weight) : "#a78bfa"
+        }
         onNodeClick={(n: GNode) => selectNode(n.id)}
         onBackgroundClick={() => selectNode(null)}
         // enableNodeDrag intentionally OFF — works around a bug in

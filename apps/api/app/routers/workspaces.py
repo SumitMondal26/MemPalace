@@ -23,6 +23,7 @@ router = APIRouter()
 class RebuildEdgesResponse(BaseModel):
     edges_created: int
     k_neighbors: int
+    min_weight: float
 
 
 @router.post(
@@ -33,11 +34,14 @@ async def rebuild_semantic_edges(
     workspace_id: UUID,
     user_id: Annotated[str, Depends(get_user_id)],
     sb_user: Annotated[Client, Depends(supabase_user)],
-    # Auto-connect v2 (migration 0005): best-pair-chunk similarity + kNN per
-    # node. No more threshold tuning. K=3 → each node gets ~3 of its most-
-    # similar partners as edges. Either-direction inclusion: A↔B forms if B
-    # is in A's top-K OR A is in B's top-K.
+    # Auto-connect v2.1 (migration 0006): best-pair-chunk + kNN per node +
+    # minimum-weight floor.
+    # K=3 → each node gets up to 3 of its most-similar partners.
+    # min_weight=0.25 → drops weak edges even if they're top-K. Real semantic
+    # matches in short-text corpora score >= 0.30; below ~0.25 are structural
+    # false-friends ("people doing things together" patterns, etc.).
     k_neighbors: int = 3,
+    min_weight: float = 0.25,
 ) -> RebuildEdgesResponse:
     """Rebuild the workspace's semantic edges via best-pair-chunk + kNN.
 
@@ -53,7 +57,11 @@ async def rebuild_semantic_edges(
     try:
         result = sb_user.rpc(
             "rebuild_semantic_edges",
-            {"ws_id": str(workspace_id), "k_neighbors": k_neighbors},
+            {
+                "ws_id": str(workspace_id),
+                "k_neighbors": k_neighbors,
+                "min_weight": min_weight,
+            },
         ).execute()
     except Exception as e:
         raise HTTPException(
@@ -65,4 +73,5 @@ async def rebuild_semantic_edges(
     return RebuildEdgesResponse(
         edges_created=edges_created,
         k_neighbors=k_neighbors,
+        min_weight=min_weight,
     )
