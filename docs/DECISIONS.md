@@ -80,6 +80,31 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-012 — Graph-augmented retrieval (1-hop neighborhood expansion)
+
+**Date:** 2026-05-14
+
+**Context.** Up until now, the graph (manual + semantic edges) was rendered in the 3D canvas but never used by RAG retrieval. `match_chunks` did pure vector search. Edges contributed nothing to answer quality — they were decoration. With the evals harness in place we can now measure whether bringing the graph into retrieval helps.
+
+**Decision.** A new SQL function `match_chunks_with_neighbors(query_embedding, match_count, neighbor_count)` does two things in one round-trip:
+1. Pure vector top-k (same as `match_chunks`) — the "seed" chunks.
+2. 1-hop graph expansion: find nodes connected by any edge (manual or semantic, undirected) to a seed node, fetch the top-N most-relevant chunks from each, and union with the seeds.
+
+Returned rows carry a `source` column ('direct' or 'neighbor') so the UI / trace can distinguish vector hits from graph expansions. `/chat` uses this function with `neighbor_count=1` by default; the existing similarity-threshold filter applies uniformly to both sources to avoid weak neighbor chunks polluting context.
+
+The eval script supports both strategies via `EVAL_STRATEGY` env var, so we can A/B compare baseline vs graph-augmented on the same golden set.
+
+**Consequence.**
+- Pro: The graph now contributes to RAG instead of being decoration. The project's central thesis ("memory as a graph") becomes operationally true, not just visual.
+- Pro: All in SQL — one round-trip; pgvector + CTEs do the heavy lifting; no Python pairwise loops.
+- Pro: Source labels enable interview story ("vector hit vs graph expansion") and future UI work (different chip styles per source).
+- Pro: A/B-measurable from day one via the eval strategy switch.
+- Con: Query is more expensive than `match_chunks` (extra JOINs against edges + window function over neighbor chunks). For small workspaces, negligible. For workspaces with thousands of nodes + dense semantic graphs, may need an upper bound on neighbor candidates per seed.
+- Con: Treats all edges as equally weighted in expansion. Manual edges (user intent) and semantic edges of varying strength all bring in 1-hop neighbors. P3 work: weight expansion by edge weight + kind.
+- Con: Currently only 1 hop. Multi-hop reasoning (sumit → sumit's gf → her age) needs P3 agent loop, not pure SQL.
+
+---
+
 ## ADR-011 — Retrieval evals: standalone Python script + JSON golden set
 
 **Date:** 2026-05-14

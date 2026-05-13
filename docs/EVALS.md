@@ -81,6 +81,34 @@ Aim for 20-30 cases over time, covering:
 
 This is the discipline that distinguishes RAG engineering from RAG vibes.
 
+## Switching retrieval strategies (A/B comparison)
+
+The script supports two retrieval functions via an env var:
+
+```bash
+# Baseline: pure vector search (default)
+make evals
+
+# Graph-augmented: vector search + 1-hop neighborhood expansion
+EVAL_STRATEGY=match_chunks_with_neighbors make evals
+```
+
+This lets you measure the impact of any retrieval change against the same golden set. Workflow:
+
+1. Run baseline → write down numbers.
+2. Change retrieval (new strategy / new SQL / new threshold).
+3. Run with the new strategy → compare numbers.
+4. Keep or revert based on what the metrics say.
+
+The eval script header tells you which strategy is in effect:
+
+```
+== Mem Palace retrieval evals ==
+   8 cases · k_max=10 · model=text-embedding-3-small · strategy=match_chunks_with_neighbors (neighbor_count=1)
+```
+
+---
+
 ## Limitations and what's next
 
 P1 evals measure **retrieval recall only**. They do *not* measure:

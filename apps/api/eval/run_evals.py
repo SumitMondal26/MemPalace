@@ -66,6 +66,16 @@ SERVICE_KEY = ENV.get("SUPABASE_SERVICE_ROLE_KEY", "")
 OPENAI_KEY = ENV.get("OPENAI_API_KEY", "")
 EMBED_MODEL = ENV.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
+# Retrieval strategy: "match_chunks" (baseline, vector only) or
+# "match_chunks_with_neighbors" (graph-augmented). Override via env:
+#   EVAL_STRATEGY=match_chunks_with_neighbors make evals
+STRATEGY = os.environ.get(
+    "EVAL_STRATEGY", ENV.get("EVAL_STRATEGY", "match_chunks")
+)
+NEIGHBOR_COUNT = int(
+    os.environ.get("EVAL_NEIGHBOR_COUNT", ENV.get("EVAL_NEIGHBOR_COUNT", "1"))
+)
+
 for name, val in (
     ("SUPABASE_URL", SUPABASE_URL),
     ("SUPABASE_SERVICE_ROLE_KEY", SERVICE_KEY),
@@ -120,9 +130,12 @@ def embed(question: str) -> list[float]:
 
 
 def search_chunks(query_vec: list[float], k: int) -> list[dict]:
+    payload: dict = {"query_embedding": query_vec, "match_count": k}
+    if STRATEGY == "match_chunks_with_neighbors":
+        payload["neighbor_count"] = NEIGHBOR_COUNT
     return post_json(
-        f"{SUPABASE_URL}/rest/v1/rpc/match_chunks",
-        {"query_embedding": query_vec, "match_count": k},
+        f"{SUPABASE_URL}/rest/v1/rpc/{STRATEGY}",
+        payload,
         {"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"},
     )
 
@@ -190,14 +203,20 @@ def main() -> int:
 
     golden = json.loads(golden_path.read_text())
     cases = golden.get("cases", [])
-    k_max = int(golden.get("k_max", 10))
+    # k_max can be overridden via env (EVAL_K_MAX=3 make evals) for stress tests
+    # without editing golden.json.
+    k_max = int(os.environ.get("EVAL_K_MAX", golden.get("k_max", 10)))
 
     if not cases:
         print("No cases in golden.json — nothing to evaluate.")
         return 0
 
     print(f"== Mem Palace retrieval evals ==")
-    print(f"   {len(cases)} cases · k_max={k_max} · model={EMBED_MODEL}")
+    print(
+        f"   {len(cases)} cases · k_max={k_max} · model={EMBED_MODEL} · "
+        f"strategy={STRATEGY}"
+        + (f" (neighbor_count={NEIGHBOR_COUNT})" if STRATEGY.endswith("neighbors") else "")
+    )
     print()
 
     titles = fetch_node_titles()

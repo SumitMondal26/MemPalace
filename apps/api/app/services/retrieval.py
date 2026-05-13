@@ -40,6 +40,30 @@ async def search_chunks(
     return result.data or []
 
 
+async def search_chunks_with_neighbors(
+    sb_user: Client,
+    query_embedding: list[float],
+    k: int = 5,
+    neighbor_count: int = 1,
+) -> list[dict]:
+    """Graph-augmented retrieval: top-k by vector + 1-hop graph expansion.
+
+    Returns chunks with an extra `source` field: "direct" (came from vector
+    similarity) or "neighbor" (pulled in via an edge from a direct hit's node).
+    """
+    if not query_embedding:
+        return []
+    result = sb_user.rpc(
+        "match_chunks_with_neighbors",
+        {
+            "query_embedding": query_embedding,
+            "match_count": k,
+            "neighbor_count": neighbor_count,
+        },
+    ).execute()
+    return result.data or []
+
+
 async def retrieve(
     sb_user: Client,
     openai: AsyncOpenAI,

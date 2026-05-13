@@ -34,7 +34,7 @@ from supabase import Client
 
 from ..deps import openai_client, supabase_user
 from ..services.llm import stream_chat
-from ..services.retrieval import embed_query, search_chunks
+from ..services.retrieval import embed_query, search_chunks_with_neighbors
 
 router = APIRouter()
 
@@ -75,18 +75,21 @@ async def chat(
         )
         q_vec = await embed_query(openai, body.question)
 
-        # Stage 2: vector search.
+        # Stage 2: graph-augmented vector search.
         yield _sse(
             "stage",
-            {"label": "Searching memory", "elapsed_ms": ms()},
+            {"label": "Searching memory + 1-hop graph", "elapsed_ms": ms()},
         )
-        raw_chunks = await search_chunks(sb_user, q_vec, body.k)
+        raw_chunks = await search_chunks_with_neighbors(
+            sb_user, q_vec, body.k, neighbor_count=1
+        )
 
         # Filter out low-similarity matches — they're noise. The match_chunks
         # RPC returns top-k by ranking even if every match is bad (e.g. asking
         # "hello" against a corpus of technical content); passing those to the
         # LLM produces "I don't have that in your memory yet" when the right
-        # behavior is to chat conversationally.
+        # behavior is to chat conversationally. Apply the same threshold to
+        # neighbor chunks so a weak graph hit doesn't pollute the prompt.
         chunks = [
             c
             for c in raw_chunks
@@ -94,13 +97,15 @@ async def chat(
         ]
 
         # Surface the chunks that made the cut so the UI cites only the ones
-        # the model actually saw. Empty list => no source chips render.
+        # the model actually saw. The `source` field tags each chunk as
+        # "direct" (vector hit) or "neighbor" (graph expansion).
         sources = [
             {
                 "i": i + 1,
                 "id": c["id"],
                 "node_id": c["node_id"],
                 "similarity": c.get("similarity"),
+                "source": c.get("source", "direct"),
                 "preview": (c["content"] or "")[:240],
             }
             for i, c in enumerate(chunks)
