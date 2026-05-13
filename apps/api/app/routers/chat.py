@@ -38,6 +38,14 @@ from ..services.retrieval import embed_query, search_chunks
 
 router = APIRouter()
 
+# Cosine similarity threshold below which a retrieved chunk is considered
+# noise. The match_chunks RPC returns top-k strictly by ranking, even when
+# the query has no relevant matches at all (e.g. "hello" against technical
+# content). Below ~0.4 the chunk is more likely to pollute the prompt with
+# irrelevant context than to help — we'd rather show the model nothing
+# and have it respond conversationally.
+RELEVANCE_THRESHOLD = 0.4
+
 
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1)
@@ -72,9 +80,21 @@ async def chat(
             "stage",
             {"label": "Searching memory", "elapsed_ms": ms()},
         )
-        chunks = await search_chunks(sb_user, q_vec, body.k)
+        raw_chunks = await search_chunks(sb_user, q_vec, body.k)
 
-        # Surface the retrieved chunks so the UI can show citations early.
+        # Filter out low-similarity matches — they're noise. The match_chunks
+        # RPC returns top-k by ranking even if every match is bad (e.g. asking
+        # "hello" against a corpus of technical content); passing those to the
+        # LLM produces "I don't have that in your memory yet" when the right
+        # behavior is to chat conversationally.
+        chunks = [
+            c
+            for c in raw_chunks
+            if (c.get("similarity") or 0.0) >= RELEVANCE_THRESHOLD
+        ]
+
+        # Surface the chunks that made the cut so the UI cites only the ones
+        # the model actually saw. Empty list => no source chips render.
         sources = [
             {
                 "i": i + 1,
@@ -89,17 +109,13 @@ async def chat(
 
         # Stage 3: prompt assembly + LLM stream.
         plural = "s" if len(chunks) != 1 else ""
-        yield _sse(
-            "stage",
-            {
-                "label": (
-                    f"Composing answer from {len(chunks)} chunk{plural}"
-                    if chunks
-                    else "Composing answer (no context found)"
-                ),
-                "elapsed_ms": ms(),
-            },
-        )
+        if chunks:
+            stage_label = f"Composing answer from {len(chunks)} chunk{plural}"
+        elif raw_chunks:
+            stage_label = "No strong matches — replying conversationally"
+        else:
+            stage_label = "Memory is empty — replying conversationally"
+        yield _sse("stage", {"label": stage_label, "elapsed_ms": ms()})
 
         async for token in stream_chat(openai, body.question, chunks):
             yield _sse("token", token)

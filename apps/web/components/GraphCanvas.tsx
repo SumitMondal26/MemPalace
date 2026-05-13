@@ -239,7 +239,14 @@ export default function GraphCanvas({
         linkDirectionalParticleColor={() => "#a78bfa"}
         onNodeClick={(n: GNode) => selectNode(n.id)}
         onBackgroundClick={() => selectNode(null)}
-        enableNodeDrag={true}
+        // enableNodeDrag intentionally OFF — works around a bug in
+        // 3d-force-graph 1.80.x where DragControls' synthetic pointercancel
+        // event gets forwarded to OrbitControls.onPointerUp, which tries to
+        // read `.x` on it and crashes. The error fired on EVERY node click
+        // (zero-distance drag = cancel). Selection still works because the
+        // lib uses raycaster picking, not DragControls, for click detection.
+        // Camera orbit / zoom / pan remain fully functional.
+        enableNodeDrag={false}
         controlType="orbit"
         cooldownTicks={200}
         warmupTicks={50}
@@ -257,35 +264,43 @@ export default function GraphCanvas({
             fz?: number | null;
           },
         ) => {
-          // While the user is dragging, the lib pins via fx/fy/fz. Honor that.
-          if (node.fx != null && node.fy != null && node.fz != null) {
-            nodeObj.position.set(node.fx, node.fy, node.fz);
+          try {
+            // While the user is dragging, the lib pins via fx/fy/fz. Honor that.
+            if (node.fx != null && node.fy != null && node.fz != null) {
+              nodeObj.position.set(node.fx, node.fy, node.fz);
+              return true;
+            }
+
+            // Initialize oscillation params once per node. Safe defaults so
+            // we never compute Math.sin(NaN) which would produce a NaN
+            // position that three.js complains about.
+            const phase = node.__phase ?? (node.__phase = Math.random() * Math.PI * 2);
+            const freq = node.__freq ?? (node.__freq = 0.25 + Math.random() * 0.35);
+
+            const baseX = Number.isFinite(node.x) ? (node.x as number) : 0;
+            const baseY = Number.isFinite(node.y) ? (node.y as number) : 0;
+            const baseZ = Number.isFinite(node.z) ? (node.z as number) : 0;
+
+            const t = performance.now() / 1000;
+            const amp = 8;
+
+            const x = baseX + Math.sin(t * freq + phase) * amp;
+            const y = baseY + Math.cos(t * freq * 1.1 + phase) * amp;
+            const z = baseZ + Math.sin(t * freq * 0.9 + phase * 1.5) * amp;
+
+            // Final NaN guard — if anything upstream went sideways, fall back
+            // to the data position instead of writing NaN into three.js.
+            nodeObj.position.set(
+              Number.isFinite(x) ? x : baseX,
+              Number.isFinite(y) ? y : baseY,
+              Number.isFinite(z) ? z : baseZ,
+            );
             return true;
+          } catch {
+            // Never throw from a per-frame callback — that would spam the
+            // dev overlay every animation tick.
+            return false;
           }
-
-          // First time we see this node, give it a unique oscillation.
-          if (node.__phase == null) {
-            node.__phase = Math.random() * Math.PI * 2;
-            node.__freq = 0.25 + Math.random() * 0.35;
-          }
-
-          // node.x/y/z is the *data* position written by the d3-force sim.
-          // It's stable after cooldown — using it as the orbit center avoids
-          // the feedback loop where `coords` (the lib's previous output)
-          // accumulates our offset every frame.
-          const baseX = node.x ?? 0;
-          const baseY = node.y ?? 0;
-          const baseZ = node.z ?? 0;
-
-          const t = performance.now() / 1000;
-          const amp = 8;
-
-          nodeObj.position.set(
-            baseX + Math.sin(t * node.__freq! + node.__phase) * amp,
-            baseY + Math.cos(t * node.__freq! * 1.1 + node.__phase) * amp,
-            baseZ + Math.sin(t * node.__freq! * 0.9 + node.__phase * 1.5) * amp,
-          );
-          return true;
         }}
       />
     </div>

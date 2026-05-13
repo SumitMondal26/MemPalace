@@ -53,13 +53,15 @@ This means *every* memory ends up in the `chunks` table, behind the same `match_
 
 ---
 
-## Retrieval (P1, naive)
+## Retrieval (P1)
 
 ```
-query → embed → SELECT ... ORDER BY embedding <=> q LIMIT k
+query → embed → SELECT ... ORDER BY embedding <=> q LIMIT k → filter sim ≥ 0.4
 ```
 
-`k = 5` for chat. No filtering, no reranking yet. This is the baseline.
+`k = 5` for chat. After ranked retrieval we **filter by absolute similarity** ≥ 0.4. Reason: cosine-ranked top-k returns the *least bad* k chunks even when none are actually relevant ("hello" against a technical corpus). Passing low-similarity chunks to the model produces brittle "I don't have that in your memory" responses for greetings and meta-questions. With the filter, the LLM gets either confident context (→ grounded answer with citations) or empty context (→ conversational reply, no fake citations).
+
+No reranking yet. P2 will add hybrid retrieval (vector + BM25) and a cross-encoder reranker.
 
 **What we'll measure in P2:**
 - recall@k on a hand-built golden set (20-50 Q→A pairs from real documents)
