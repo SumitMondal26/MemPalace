@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
+import { semanticEdgeColor } from "@/lib/edgeTiers";
 import { useGraphStore } from "@/lib/store";
 
 /**
@@ -37,21 +38,8 @@ const FALLBACK_COLOR = "#7c5cff";
 const SELECTED_COLOR = "#ffffff";
 const MANUAL_EDGE_COLOR = "#3b3d52";
 
-/**
- * Smooth color gradient for semantic edges based on weight (cosine similarity).
- * - 0.25 (just above floor): dim cool-purple, almost background
- * - 0.45: brand purple
- * - 0.65+: bright electric magenta-purple
- *
- * Lets the eye read edge strength at a glance without filtering anything out.
- */
-function semanticEdgeColor(weight: number): string {
-  const t = Math.max(0, Math.min(1, (weight - 0.25) / 0.45));
-  const h = 260 + t * 30;       // deep blue-purple → pink-magenta
-  const s = 35 + t * 50;        // muted → saturated
-  const l = 38 + t * 27;        // dim → bright
-  return `hsl(${h.toFixed(0)}, ${s.toFixed(0)}%, ${l.toFixed(0)}%)`;
-}
+// Edge tiers + color function live in lib/edgeTiers.ts so the legend in
+// GraphPageClient reads from the same source of truth (see import above).
 
 type GNode = { id: string; type: string; title: string | null };
 type GLink = {
@@ -158,6 +146,41 @@ export default function GraphCanvas({
       geo?.dispose();
       mat?.dispose();
     };
+  }, []);
+
+  // Force-simulation tuning: bump link distance + charge repulsion so edges
+  // have visible length and nodes don't pile on top of each other. d3-force
+  // defaults are ~30 unit link distance / -30 charge — too cramped for a
+  // small graph at our zoom level.
+  useEffect(() => {
+    let attempts = 0;
+    const wait = setInterval(() => {
+      attempts++;
+      const fg = fgRef.current as unknown as {
+        d3Force?: (name: string) => {
+          distance?: (d: number) => unknown;
+          strength?: (s: number) => unknown;
+        } | null;
+        resumeAnimation?: () => void;
+      };
+      if (!fg?.d3Force) {
+        if (attempts > 20) clearInterval(wait);
+        return;
+      }
+      clearInterval(wait);
+
+      // Minimum desired distance between connected nodes.
+      const linkForce = fg.d3Force("link");
+      linkForce?.distance?.(80);
+
+      // Stronger repulsion so unconnected nodes spread out.
+      const chargeForce = fg.d3Force("charge");
+      chargeForce?.strength?.(-150);
+
+      // Forces only apply while the sim is running. Kick it back if cooled.
+      fg.resumeAnimation?.();
+    }, 100);
+    return () => clearInterval(wait);
   }, []);
 
   // Continuous floating motion via the per-frame nodePositionUpdate callback

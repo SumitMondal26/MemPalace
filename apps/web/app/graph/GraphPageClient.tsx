@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import ChatPanel from "@/components/ChatPanel";
 import GraphCanvas from "@/components/GraphCanvas";
 import Sidebar from "@/components/Sidebar";
+import { EDGE_TIERS } from "@/lib/edgeTiers";
 import { api } from "@/lib/api";
 import * as db from "@/lib/db";
 import type { DbEdge, DbNode, NodeType } from "@/lib/db";
@@ -28,6 +29,27 @@ type Props = {
 };
 
 const NODE_TYPES: NodeType[] = ["note", "doc", "url"];
+
+function LegendRow({
+  color,
+  label,
+  range,
+}: {
+  color: string;
+  label: string;
+  range: string;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span
+        className="inline-block h-[3px] w-7 rounded"
+        style={{ background: color }}
+      />
+      <span className="flex-1">{label}</span>
+      <span className="text-neutral-600">{range}</span>
+    </div>
+  );
+}
 
 export default function GraphPageClient({
   userEmail,
@@ -182,6 +204,28 @@ export default function GraphPageClient({
             {autoConnectMsg}
           </span>
         )}
+
+        {/* Edge-strength legend */}
+        <div className="mt-1 space-y-1 rounded-lg bg-palace-panel/80 px-3 py-2 text-[10px] text-neutral-300 ring-1 ring-palace-edge backdrop-blur">
+          <div className="mb-1 text-[9px] font-semibold uppercase tracking-wider text-neutral-500">
+            Edge strength
+          </div>
+          <LegendRow
+            color={EDGE_TIERS.strong.color}
+            label={EDGE_TIERS.strong.label}
+            range={`≥ ${EDGE_TIERS.strong.min.toFixed(2)}`}
+          />
+          <LegendRow
+            color={EDGE_TIERS.medium.color}
+            label={EDGE_TIERS.medium.label}
+            range={`${EDGE_TIERS.medium.min.toFixed(2)}–${EDGE_TIERS.strong.min.toFixed(2)}`}
+          />
+          <LegendRow
+            color={EDGE_TIERS.weak.color}
+            label={EDGE_TIERS.weak.label}
+            range={`${EDGE_TIERS.weak.min.toFixed(2)}–${EDGE_TIERS.medium.min.toFixed(2)}`}
+          />
+        </div>
       </div>
 
       {/* Sidebar — slides in from the right when a node is selected */}
