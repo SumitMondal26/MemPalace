@@ -132,7 +132,24 @@ This is **not** a changelog (those are version-anchored). This is a **learning l
 
 ---
 
-## 2026-05-14 — `<this-commit>` — docs housekeeping
+## 2026-05-14 — auto-connect v2 (best-pair-chunk + kNN per node)
+
+**Shipped:**
+- Migration `0005_rebuild_semantic_edges_v2.sql`: replaces the SQL function with best-pair-chunk similarity + kNN-per-node ranking. Same function name, same endpoint — backward-compatible.
+- API endpoint param: `sim_threshold` → `k_neighbors` (default 3).
+- ADR-013 capturing the architectural shift.
+- RAG_NOTES.md updated to reflect the new approach.
+
+**What I learned:**
+- **Threshold tuning was a symptom, not a fix.** Each iteration (0.65 → 0.5 → 0.4) revealed a deeper problem: a single global threshold can't serve different node-pair categories that live on different similarity scales. Realizing this, then changing the *shape* of the decision (kNN per node, no global threshold), is more valuable than another tuning pass.
+- **Mean-of-chunks for long docs is structural dilution.** The math is broken regardless of threshold. Best-pair-chunk (max over chunk pairs) makes long docs operational because *one* matching chunk is enough to forge a connection.
+- **"Relative > absolute" is a recurring pattern in retrieval.** Similar to recall@k vs absolute distance — what matters is *order*, not raw scores. kNN inherits this principle.
+- **Either-direction kNN is more inclusive than mutual-kNN.** Mutual gives stricter signal; either gives every node ~K connections (no orphans). For a memory graph where you want visual connectivity, either-direction is the right choice. Edge weight carries the strength signal so weak edges fade visually without being filtered.
+- **Architectural courage > parameter tuning.** "We can't just keep lowering threshold" is the kind of insight that distinguishes an engineer from a tuner. The fix is changing the model, not the parameter.
+
+---
+
+## 2026-05-14 — `adfea8b` — docs housekeeping
 
 **Shipped:**
 - ROADMAP.md updated to reflect P1 ✅ + P2 partial; added P1-polish sub-list

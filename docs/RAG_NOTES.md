@@ -53,27 +53,31 @@ This means *every* memory ends up in the `chunks` table, behind the same `match_
 
 ---
 
-## Semantic edges (auto-connect)
+## Semantic edges (auto-connect v2)
 
-The "✨ Auto-connect" button triggers `POST /workspaces/{id}/rebuild-edges` → SQL function `rebuild_semantic_edges`:
+The "✨ Auto-connect" button triggers `POST /workspaces/{id}/rebuild-edges` → SQL function `rebuild_semantic_edges` (migration 0005):
 
-1. Compute mean(chunk.embedding) per node (pgvector `avg(vector)` aggregate).
-2. Pairwise cosine: `1 - (a.embedding <=> b.embedding)` for every node pair.
-3. Insert `kind='semantic'` edges for pairs above threshold (0.65 default).
-4. Idempotent — clears existing semantic edges before inserting fresh ones.
+1. **Best-pair-chunk similarity per node-pair**: `max(1 - (chunk_a.embedding <=> chunk_b.embedding))` over all chunk pairs across A and B.
+2. **kNN per node**: for each node, take top-K most-similar partners (K=3 default).
+3. **Either-direction inclusion**: an edge forms if a node is in *either* party's top-K.
+4. Insert `kind='semantic'` edges with `weight = similarity`. Manual edges untouched.
 
-The 3D canvas renders semantic edges with animated purple particles flowing source→target — visually distinct from grey manual edges. Force-directed layout pulls semantically-similar nodes into spatial clusters automatically.
+The 3D canvas renders semantic edges with animated purple particles. Edge `weight` modulates particle density / line opacity — strong edges are bright, weak edges fade.
 
-**Coarse-but-fast representation.** "Node-mean embedding" is the simplest viable summary of a node. It works well for notes (1 chunk = the chunk's own vector) and short docs. For long docs whose mean lies in a "general topic" zone, it can miss connections where a single chunk is a very specific match. P2 upgrade path: `best-pair-chunk` similarity (max over chunk-pair Cartesian product) or LLM-judge for borderline pairs.
+**Why best-pair-chunk over node-mean.** Mean-of-chunks dilutes a long doc's content into a generic-topic vector. A 23-chunk paper's mean lives in "AI paper space" and matches nothing specifically. With best-pair-chunk, the doc connects to anything whose content matches *any one* of its chunks strongly. Long docs become first-class citizens of the graph.
 
-**Threshold tuning — empirically anchored at 0.4.** Iteration on real data:
-- `0.65` (theory): produced 0 edges. Too strict for short text.
-- `0.50`: caught only the very strongest pair (`sumit` ↔ `sumit's age` @ 0.617).
-- `0.40`: catches related entities like `Eijuuu (sumit's gf)` ↔ `sumit` @ 0.427.
+**Why kNN over absolute threshold.** A single threshold can't serve all node-pair categories: short note vs short note peaks ~0.6, short note vs long-doc-mean peaks ~0.4, related entities in different sentence templates peak ~0.4. kNN per node adapts naturally — every node gets ~K of its most-similar partners regardless of absolute scale. No threshold to tune.
 
-The lesson: short notes + node-mean embedding → similarities cluster 0.3–0.7, not the 0.8+ you see from paragraph-length chunks. **0.4 is the realistic floor** without an LLM-rerank pass; below that you start linking unrelated pairs that just share sentence templates ("X is N years old" matches itself across entities). Long-doc workspaces could go higher (~0.55) once P2 best-pair-chunk lands.
+### Threshold tuning history (kept for the lesson)
 
-**Why pure embedding similarity has a ceiling on short text:** embedding-based similarity weighs surface form (token overlap, sentence structure) alongside semantic content, inseparably. Two short sentences about the same entity in different structures (`"my name is sumit"` vs `"sumit's girlfriend is X"`) score lower than two short sentences with the same template about different entities (`"X is N years old"` vs `"Y is M years old"`). Real fix is reranking with an LLM that understands entities — P3 work.
+The path to kNN went through three threshold iterations:
+- `0.65` (theory): produced 0 edges. Too strict.
+- `0.50`: caught only the very strongest pair (`sumit ↔ sumit's age` @ 0.617).
+- `0.40`: caught related-entity pairs (`Eijuuu ↔ sumit` @ 0.427) but missed obvious things like `sumit ↔ sumit-and-books` @ 0.386 — ONE point below cutoff.
+
+The lesson: tuning a single global threshold is a symptom of using a model that's too simple for the data. The fix isn't a better threshold; it's a different decision shape (kNN). And mean-of-chunks for long docs is structural dilution that no threshold can resolve — best-pair-chunk fixes that at the source.
+
+**Why embedding similarity has a ceiling on short text** (still relevant): embedding-based similarity weighs surface form alongside semantic content, inseparably. Two short sentences about the same entity in different structures score lower than two unrelated short sentences in the same template. Fixes: best-pair-chunk (smaller-context-larger-overlap), hybrid retrieval (BM25 + vector), or LLM-rerank for entity resolution. We've shipped best-pair-chunk; hybrid + LLM-judge are P2/P3.
 
 ---
 

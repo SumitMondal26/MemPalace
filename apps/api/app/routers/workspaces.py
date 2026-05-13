@@ -22,7 +22,7 @@ router = APIRouter()
 
 class RebuildEdgesResponse(BaseModel):
     edges_created: int
-    threshold: float
+    k_neighbors: int
 
 
 @router.post(
@@ -33,31 +33,27 @@ async def rebuild_semantic_edges(
     workspace_id: UUID,
     user_id: Annotated[str, Depends(get_user_id)],
     sb_user: Annotated[Client, Depends(supabase_user)],
-    # Empirical default for OpenAI text-embedding-3-small over node-mean
-    # embeddings on short notes. Iteration history:
-    #   0.65 → 0 edges (theoretical guess, too strict for short text)
-    #   0.50 → caught only the very strongest pair (sumit ↔ sumit's age @ 0.617)
-    #   0.40 → catches related entities like Eijuuu (sumit's gf) ↔ sumit @ 0.427,
-    #          at the cost of 1-2 surface-form false friends per N nodes.
-    # For short notes this is the realistic ceiling without an LLM-rerank pass.
-    # Long-doc workspaces could go higher (~0.55) once P2 best-pair-chunk lands.
-    sim_threshold: float = 0.4,
+    # Auto-connect v2 (migration 0005): best-pair-chunk similarity + kNN per
+    # node. No more threshold tuning. K=3 → each node gets ~3 of its most-
+    # similar partners as edges. Either-direction inclusion: A↔B forms if B
+    # is in A's top-K OR A is in B's top-K.
+    k_neighbors: int = 3,
 ) -> RebuildEdgesResponse:
-    """Rebuild the workspace's semantic edges based on node-embedding similarity.
+    """Rebuild the workspace's semantic edges via best-pair-chunk + kNN.
 
     Calls the `rebuild_semantic_edges` SQL function defined in
-    `supabase/migrations/0003_rebuild_semantic_edges.sql`. The function:
-      1. Verifies workspace ownership via RLS on DELETE/INSERT.
-      2. Removes existing kind='semantic' edges.
-      3. Computes mean(chunk.embedding) per node.
-      4. Inserts an edge for every node pair with cosine similarity >= threshold.
+    `supabase/migrations/0005_rebuild_semantic_edges_v2.sql`. The function:
+      1. Computes max(cosine(chunk_a, chunk_b)) for every node pair.
+      2. For each node, ranks all other nodes by that similarity.
+      3. Inserts an edge if a node is in either party's top-K neighbors.
+      4. Manual edges (kind='manual') are untouched.
 
-    Manual edges (kind='manual') are untouched.
+    RLS on edges/chunks/nodes applies (function is STABLE, runs as caller).
     """
     try:
         result = sb_user.rpc(
             "rebuild_semantic_edges",
-            {"ws_id": str(workspace_id), "sim_threshold": sim_threshold},
+            {"ws_id": str(workspace_id), "k_neighbors": k_neighbors},
         ).execute()
     except Exception as e:
         raise HTTPException(
@@ -68,5 +64,5 @@ async def rebuild_semantic_edges(
     edges_created = result.data if isinstance(result.data, int) else 0
     return RebuildEdgesResponse(
         edges_created=edges_created,
-        threshold=sim_threshold,
+        k_neighbors=k_neighbors,
     )

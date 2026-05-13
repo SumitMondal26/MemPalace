@@ -10,6 +10,7 @@ type Source = {
   node_id: string;
   similarity: number | null;
   preview: string;
+  source?: "direct" | "neighbor";
 };
 
 type Stage = {
@@ -265,11 +266,21 @@ function AssistantTurn({
 }) {
   const trace = message.trace ?? [];
   const isDone = message.doneMs != null;
+  const [expandedI, setExpandedI] = useState<number | null>(null);
+
+  const expandedSource =
+    expandedI != null
+      ? message.sources?.find((s) => s.i === expandedI) ?? null
+      : null;
 
   return (
     <div className="space-y-2">
       {trace.length > 0 && (
-        <Trace stages={trace} doneMs={message.doneMs ?? null} isLive={isStreaming && !isDone} />
+        <Trace
+          stages={trace}
+          doneMs={message.doneMs ?? null}
+          isLive={isStreaming && !isDone}
+        />
       )}
 
       <div className="inline-block max-w-[95%] whitespace-pre-wrap rounded-2xl bg-palace-bg px-3 py-2 text-sm leading-relaxed text-neutral-200 ring-1 ring-palace-edge">
@@ -282,21 +293,72 @@ function AssistantTurn({
       </div>
 
       {message.sources && message.sources.length > 0 && (
-        <div className="flex flex-wrap gap-1">
-          {message.sources.map((s) => (
-            <span
-              key={s.id}
-              title={s.preview}
-              className="cursor-help rounded bg-palace-bg px-1.5 py-0.5 text-[10px] text-neutral-400 ring-1 ring-palace-edge"
-            >
-              [{s.i}]
-              {s.similarity != null && (
-                <span className="ml-1 text-neutral-600">
-                  {(s.similarity * 100).toFixed(0)}%
+        <div className="space-y-2">
+          <div className="flex flex-wrap gap-1">
+            {message.sources.map((s) => {
+              const isExpanded = s.i === expandedI;
+              const isNeighbor = s.source === "neighbor";
+              return (
+                <button
+                  key={s.id}
+                  onClick={() =>
+                    setExpandedI(isExpanded ? null : s.i)
+                  }
+                  className={[
+                    "rounded px-1.5 py-0.5 text-[10px] ring-1 transition",
+                    isExpanded
+                      ? "bg-palace-accent/30 text-white ring-palace-accent"
+                      : isNeighbor
+                        ? "bg-palace-bg text-purple-300 ring-purple-900/60 hover:ring-purple-700"
+                        : "bg-palace-bg text-neutral-400 ring-palace-edge hover:ring-neutral-500",
+                  ].join(" ")}
+                  title={
+                    isNeighbor
+                      ? "From graph expansion (1-hop neighbor)"
+                      : "Direct vector match"
+                  }
+                >
+                  [{s.i}]
+                  {s.similarity != null && (
+                    <span className="ml-1 opacity-70">
+                      {(s.similarity * 100).toFixed(0)}%
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {expandedSource && (
+            <div className="rounded-lg bg-palace-bg/90 p-3 text-xs leading-relaxed text-neutral-300 ring-1 ring-palace-edge">
+              <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-wider text-neutral-500">
+                <span>source [{expandedSource.i}]</span>
+                <span className="text-neutral-700">·</span>
+                <span
+                  className={
+                    expandedSource.source === "neighbor"
+                      ? "text-purple-400"
+                      : "text-emerald-400"
+                  }
+                >
+                  {expandedSource.source === "neighbor"
+                    ? "graph 1-hop"
+                    : "direct match"}
                 </span>
-              )}
-            </span>
-          ))}
+                {expandedSource.similarity != null && (
+                  <>
+                    <span className="text-neutral-700">·</span>
+                    <span>
+                      {(expandedSource.similarity * 100).toFixed(0)}% similar
+                    </span>
+                  </>
+                )}
+              </div>
+              <div className="whitespace-pre-wrap">
+                {expandedSource.preview}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

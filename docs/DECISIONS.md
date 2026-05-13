@@ -80,6 +80,36 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-013 — Auto-connect v2: best-pair-chunk + kNN per node
+
+**Date:** 2026-05-14
+
+**Context.** ADR-010 shipped auto-connect with two design choices that turned out to be wrong as the corpus grew:
+1. **Mean-of-chunks** as a node's representative embedding. For long docs (the 23-chunk Transformer paper), the mean lives in a generic "AI paper" zone and matches nothing specifically. Result: `book` was permanently isolated from any short note even when the topic clearly overlapped (e.g., `"sumit likes reading books related to AI"` scored only 0.315 against `book`).
+2. **Single global threshold** (0.4) for whether to create an edge. Different node-pair categories live on different similarity scales — short-note vs short-note peaks ~0.6, short-note vs long-doc-mean peaks ~0.4, related entities in different sentence templates peak ~0.4. No single threshold serves all of them.
+
+The user-facing failure mode: after each new note, *some* obvious connections didn't form. The temptation was to keep lowering the threshold. The realization: tuning a threshold forever can't fix a model that's wrong-shaped. Real systems use multiple signals and relative (not absolute) ranking.
+
+**Decision.** Migration `0005_rebuild_semantic_edges_v2.sql` replaces the SQL function with two architectural shifts in one rewrite:
+
+1. **Best-pair-chunk similarity:** for every node pair (A, B), compute `max(1 - (chunk_a.embedding <=> chunk_b.embedding))` over all chunk pairs across A and B. The max — not the mean. A long doc connects to a note as long as *one* chunk matches strongly.
+2. **kNN per node (no threshold):** for each node, rank all potential partners by best-pair-chunk score, take top-K (default K=3). An edge forms if a node is in either party's top-K (either-direction inclusion). No absolute cutoff.
+
+`weight` on the edge stores the actual similarity so the canvas can fade weak edges without filtering them out.
+
+**Consequence.**
+- Pro: No more threshold tuning. Every node always gets ~K visible connections.
+- Pro: Long docs become first-class graph citizens. The `book` problem dissolves.
+- Pro: Adapts naturally to corpus growth. A node in a dense cluster connects to its tightest local neighbors; a node in a sparse area connects to its 3 nearest, even if absolute similarity is low.
+- Pro: Backward-compatible API surface (function name + endpoint unchanged; old `sim_threshold` param accepted-but-ignored).
+- Con: Quadratic in chunk count per workspace. For ~30 chunks (us): ~900 chunk-pair comparisons, instant. For ~10K chunks: ~100M comparisons — getting heavy. P3+ scale needs batched/approximate computation OR an HNSW-backed sweep.
+- Con: A node forced to have 3 connections might form weak edges in a small workspace. Acceptable because edge weight visually distinguishes strong from weak. With more memory, weak edges naturally get displaced.
+- Con: kNN doesn't enforce minimum quality. A "dense visualization with no real signal" is possible. Mitigated by edge weight rendering; future work: optionally cap edges where similarity < some floor (configurable, but no longer the central knob).
+
+**Path:** evals re-run with new edge structure to measure if retrieval lifts (or regresses) on the existing 8 cases. Add new golden cases that specifically exercise long-doc connections.
+
+---
+
 ## ADR-012 — Graph-augmented retrieval (1-hop neighborhood expansion)
 
 **Date:** 2026-05-14
