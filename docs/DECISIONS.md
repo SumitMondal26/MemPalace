@@ -80,6 +80,40 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-017 — LLM query rewriting on multi-turn /chat (P2 closer)
+
+**Date:** 2026-05-15
+
+**Context.** ADR-014 introduced multi-turn chat by sending the last 6 messages to the LLM at generation time. The *answerer* could resolve "she", "it", "the second one" from history. But the *retriever* could not — `embed_query` was called on the user's latest message in isolation. So the chat would *answer* a follow-up like "how old is she?" correctly only when retrieval got lucky and surfaced the right node anyway. The expanded golden set (commit `5a23188`) baked this asymmetry into measurable cases (`vague-partner`, `vague-her-age`).
+
+**Decision.** Add a dedicated query-rewriting step before embedding. One LLM call (gpt-4o-mini, temperature 0, `response_format=json_object`, max 120 tokens) takes the latest question + last 4 turns and returns `{"query": "..."}` — a standalone search query naming the entities. We embed *that* instead. The user-visible question still goes into the prompt verbatim (rewriter steers retrieval, not generation). New SSE event `rewrite` exposes the rewritten query so the chat panel + /insights can show users exactly what got searched.
+
+Gated on `query_rewrite_enabled` in settings (default on) AND presence of history — single-turn chats skip the call entirely (~$0.0001 + ~500ms saved). Eval harness gets a parallel `EVAL_QUERY_REWRITE=1` toggle so we can A/B exactly the same way we A/B'd graph-augmented retrieval.
+
+**Measured (20-case golden set, graph-augmented retrieval, k_max=10):**
+
+| metric    | rewrite OFF | rewrite ON |
+|-----------|-------------|------------|
+| recall@1  | 80.00%      | **85.00%** |
+| recall@3  | 95.00%      | 95.00%     |
+| recall@5  | 100%        | 100%       |
+| MRR       | 0.885       | **0.910**  |
+
+`vague-partner` flipped rank 2 → 1 (similarity 0.234 → 0.552, big jump because "partner" is now bridged to the actual name). `vague-her-age` was lucky-rank-1 already (template collision with "is X years old") but its similarity climbed 0.438 → 0.770. No other case moved — rewriter correctly returned single-turn questions unchanged.
+
+**Consequence.**
+- Pro: Closes the multi-turn weakness with a measurable +5pp recall@1 / +0.025 MRR.
+- Pro: Cleanly observable — `rewrite` SSE event + `original_question` / `rewritten_question` columns in chat_logs let /insights show exactly what got searched vs what the user typed.
+- Pro: No changes to retrieval SQL, no schema migration on chunks, no re-ingest. Pure orchestration layer change.
+- Pro: Skipped on single-turn — zero added cost or latency for the dominant case.
+- Con: Adds ~500-1500ms latency on multi-turn turns (one LLM round-trip). Could be parallelized with embed-of-original as a hedge if we ever care.
+- Con: Adds ~$0.0001 per multi-turn chat. Negligible for personal use; would matter at high RPS — gate behind a heuristic (pronoun detector?) at scale.
+- Con: Rewriter is itself an LLM and can hallucinate. Mitigations: temperature 0, JSON-mode, max_tokens 120, fall back to original on any parse failure. We never let it block the chat path.
+
+**Future work.** When hybrid retrieval lands, rewriting becomes more important because BM25 actively rewards the entity name being literally present in the query.
+
+---
+
 ## ADR-016 — Unified add-memory flow: one button + dropdown + sidebar draft
 
 **Date:** 2026-05-15

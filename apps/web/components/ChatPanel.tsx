@@ -24,6 +24,13 @@ type PromptInfo = {
   temperature: number;
 };
 
+type RewriteInfo = {
+  original: string;
+  rewritten: string;
+  was_rewritten: boolean;
+  elapsed_ms: number;
+};
+
 type DoneInfo = {
   elapsed_ms: number;
   embed_tokens?: number;
@@ -38,6 +45,7 @@ type Message = {
   sources?: Source[];
   trace?: Stage[];
   prompt?: PromptInfo;
+  rewrite?: RewriteInfo;
   done?: DoneInfo;
 };
 
@@ -138,6 +146,10 @@ export default function ChatPanel() {
     mutateLastAssistant((m) => ({ ...m, prompt }));
   }
 
+  function setRewrite(rewrite: RewriteInfo) {
+    mutateLastAssistant((m) => ({ ...m, rewrite }));
+  }
+
   function markDone(done: DoneInfo) {
     mutateLastAssistant((m) => ({ ...m, done }));
   }
@@ -185,6 +197,8 @@ export default function ChatPanel() {
       pushStage(payload as Stage);
     } else if (event === "prompt" && payload && typeof payload === "object") {
       setPrompt(payload as PromptInfo);
+    } else if (event === "rewrite" && payload && typeof payload === "object") {
+      setRewrite(payload as RewriteInfo);
     } else if (event === "done" && payload && typeof payload === "object") {
       markDone(payload as DoneInfo);
     }
@@ -310,6 +324,15 @@ function AssistantTurn({
           doneMs={message.done?.elapsed_ms ?? null}
           isLive={isStreaming && !isDone}
         />
+      )}
+
+      {message.rewrite?.was_rewritten && (
+        <div
+          className="rounded-md bg-cyan-950/40 px-2 py-1 text-[10px] text-cyan-200 ring-1 ring-cyan-900/60"
+          title={`Rewritten in ${message.rewrite.elapsed_ms}ms · used to embed the search query, NOT to answer`}
+        >
+          searched as: <span className="font-mono">{message.rewrite.rewritten}</span>
+        </div>
       )}
 
       {message.done && (

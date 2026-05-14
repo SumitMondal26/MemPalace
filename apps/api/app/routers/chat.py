@@ -5,6 +5,11 @@ SSE event types (ordered as emitted):
     event: stage     {label, elapsed_ms}
         Pipeline stage announcement. UI renders these as a live trace.
 
+    event: rewrite   {original, rewritten, was_rewritten, elapsed_ms}
+        Emitted only when query rewriting ran (multi-turn + flag enabled).
+        Lets the UI show the rewritten search query so users see exactly
+        what was sent to the embedder.
+
     event: sources   [{i, id, node_id, similarity, source, preview}, ...]
         Chunks that survived the relevance threshold filter.
 
@@ -36,6 +41,7 @@ from supabase import Client
 from ..config import settings
 from ..deps import openai_client, supabase_user
 from ..services.llm import build_chat_messages, stream_chat_messages
+from ..services.query_rewriter import rewrite_query
 from ..services.retrieval import embed_query, search_chunks_with_neighbors
 
 router = APIRouter()
@@ -99,12 +105,42 @@ async def chat(
         )
         workspace_id = ws.data["id"] if ws and ws.data else None
 
-        # === Stage 1: embed the question ===
+        # === Stage 0 (optional): rewrite the question into a standalone query ===
+        # Only runs when there's prior history AND the feature is enabled — for
+        # single-turn chats the user's question is already standalone, so we skip
+        # the LLM call (saves ~$0.0001 + ~500ms).
+        history_msgs = [
+            {"role": m.role, "content": m.content}
+            for m in body.history[-HISTORY_MAX_MESSAGES:]
+        ]
+        rewrite_should_run = (
+            settings.query_rewrite_enabled and bool(history_msgs)
+        )
+        rewrite_result = None
+        search_question = body.question
+        if rewrite_should_run:
+            yield _sse(
+                "stage",
+                {"label": "Rewriting follow-up into search query", "elapsed_ms": ms()},
+            )
+            rewrite_result = await rewrite_query(openai, body.question, history_msgs)
+            search_question = rewrite_result.rewritten
+            yield _sse(
+                "rewrite",
+                {
+                    "original": rewrite_result.original,
+                    "rewritten": rewrite_result.rewritten,
+                    "was_rewritten": rewrite_result.was_rewritten,
+                    "elapsed_ms": rewrite_result.elapsed_ms,
+                },
+            )
+
+        # === Stage 1: embed the (possibly rewritten) question ===
         t_embed_start = time.perf_counter()
         yield _sse("stage", {"label": "Encoding your question", "elapsed_ms": ms()})
 
         embed_usage: dict = {}
-        q_vec = await embed_query(openai, body.question, usage_out=embed_usage)
+        q_vec = await embed_query(openai, search_question, usage_out=embed_usage)
         embed_ms = int((time.perf_counter() - t_embed_start) * 1000)
 
         # === Stage 2: graph-augmented vector search ===
@@ -147,11 +183,10 @@ async def chat(
             stage_label = "Memory is empty — replying conversationally"
         yield _sse("stage", {"label": stage_label, "elapsed_ms": ms()})
 
-        history = [
-            {"role": m.role, "content": m.content}
-            for m in body.history[-HISTORY_MAX_MESSAGES:]
-        ]
-        messages = build_chat_messages(body.question, chunks, history)
+        # The user-facing question is what we put into the prompt — the rewrite
+        # only steers retrieval, not generation. The LLM still answers what the
+        # user actually asked.
+        messages = build_chat_messages(body.question, chunks, history_msgs)
 
         # Emit the full prompt for the chat-panel debug view.
         yield _sse(
@@ -176,10 +211,13 @@ async def chat(
         embed_tokens = embed_usage.get("tokens", 0)
         prompt_tokens = llm_usage.get("prompt_tokens", 0)
         completion_tokens = llm_usage.get("completion_tokens", 0)
-        cost_usd = _cost(
-            settings.openai_embedding_model, embed_tokens
-        ) + _cost(
-            settings.openai_chat_model, prompt_tokens, completion_tokens
+        rewrite_in = rewrite_result.prompt_tokens if rewrite_result else 0
+        rewrite_out = rewrite_result.completion_tokens if rewrite_result else 0
+        rewrite_cost = _cost(settings.openai_chat_model, rewrite_in, rewrite_out)
+        cost_usd = (
+            _cost(settings.openai_embedding_model, embed_tokens)
+            + _cost(settings.openai_chat_model, prompt_tokens, completion_tokens)
+            + rewrite_cost
         )
 
         # === Done event with totals ===
@@ -190,6 +228,8 @@ async def chat(
                 "embed_tokens": embed_tokens,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "rewrite_tokens_in": rewrite_in,
+                "rewrite_tokens_out": rewrite_out,
                 "cost_usd": round(cost_usd, 6),
             },
         )
@@ -214,7 +254,7 @@ async def chat(
                 "k_returned_filtered": len(chunks),
                 "similarity_min": min(similarities) if similarities else None,
                 "similarity_max": max(similarities) if similarities else None,
-                "history_size": len(history),
+                "history_size": len(history_msgs),
                 "embed_ms": embed_ms,
                 "search_ms": search_ms,
                 "llm_ms": llm_ms,
@@ -224,6 +264,14 @@ async def chat(
                 "completion_tokens": completion_tokens,
                 "cost_usd": round(cost_usd, 6),
                 "status": status,
+                "original_question": body.question,
+                "rewritten_question": (
+                    rewrite_result.rewritten if rewrite_result else None
+                ),
+                "rewrite_ms": rewrite_result.elapsed_ms if rewrite_result else None,
+                "rewrite_tokens_in": rewrite_in,
+                "rewrite_tokens_out": rewrite_out,
+                "rewrite_cost_usd": round(rewrite_cost, 6),
             }
             try:
                 sb_user.table("chat_logs").insert(log_row).execute()

@@ -272,3 +272,30 @@ This is **not** a changelog (those are version-anchored). This is a **learning l
 - **Docs go stale faster than code.** A README that says "P1 in progress" weeks after P1 shipped becomes a lie that confuses future readers (including you). Periodic doc passes are part of the work, not optional.
 - **Different docs serve different audiences.** README is for first-time visitors. ARCHITECTURE is for someone joining the project. DECISIONS is for someone changing the architecture. PROGRESS is for future-you reconstructing why things are the way they are. LEARNING is for the educational angle. Knowing the audience prevents one giant document that serves nobody.
 - **A "progress log" is more useful than a changelog** for learning projects. Changelogs answer "what changed in v1.2?" Progress logs answer "what did I learn while building this?" The lesson > the diff.
+
+---
+
+## 2026-05-15 — `5a23188` + (this commit) — golden set 8→20, query rewriting on multi-turn
+
+**Shipped:**
+- Golden eval set expanded 8 → 20 cases. New mix: more single-shot lookups, multi-node expansions (`cross-doc-ai-books`, `vague-partner`), long-doc paper retrievals (5 transformer-paper queries), and two pronoun-only "litmus" cases that exist specifically to measure query rewriting (`vague-partner`, `vague-her-age`). Cases that need it now carry an inline `history` field.
+- `services/query_rewriter.py` — async, defensive (always falls back to original on parse/API failure), gpt-4o-mini + JSON mode + temp 0 + max 120 tokens. Skips the LLM call entirely when no history is present.
+- `/chat` runs the rewriter as a new "Stage 0" gated on `settings.query_rewrite_enabled` AND `len(history) > 0`. Emits a new `rewrite` SSE event so the UI can show users exactly what got searched.
+- Migration `0008` adds `original_question`, `rewritten_question`, `rewrite_ms`, `rewrite_tokens_in/out`, `rewrite_cost_usd` to chat_logs (additive only, all nullable).
+- Eval harness gets `EVAL_QUERY_REWRITE=1` toggle that mirrors the production rewriter for cases carrying a `history` field.
+- ADR-017 captures the design + the measured numbers.
+
+**Measured (rewrite OFF → ON):**
+- recall@1 80% → **85%** (vague-partner flipped rank 2 → 1)
+- recall@3 95% → 95% (no churn)
+- recall@5 100% → 100% (already saturated)
+- MRR 0.885 → **0.910**
+- vague-partner sim 0.234 → 0.552 (huge — entity is now in the query)
+- vague-her-age sim 0.438 → 0.770 (was rank-1-by-luck via "is X years old" template, now rank-1-because-it-asks-the-right-thing)
+
+**What I learned:**
+- **The retriever and the generator had asymmetric context.** Multi-turn (ADR-014) gave the generator history but the retriever was still embedding the latest message in isolation. The fix isn't bigger embeddings or smarter SQL — it's recognizing the asymmetry and bridging it with one cheap LLM call. Architecture > parameters.
+- **Designing the eval set BEFORE the feature is the productive order.** Adding `vague-partner` and `vague-her-age` to golden.json *before* writing the rewriter meant the win was measurable the moment code shipped. If I'd written the rewriter first I'd have hand-tested it and shrugged. Evals turn vibes into numbers.
+- **Defensive LLM calls are different from defensive HTTP calls.** The rewriter has *three* failure modes that all need the same fallback (parse junk, API timeout, model returns wrong shape) — in every case, return the original question. Never let an auxiliary LLM call break the user's main flow.
+- **JSON mode (`response_format={"type": "json_object"}`) is cheaper than parsing prose.** Combined with temperature 0 and a short max_tokens cap, the rewriter is bounded in cost AND output shape. This is how production LLM transformations look — not "ask nicely and pray."
+- **Same-pipeline A/B is the cleanest experimental design.** The `EVAL_QUERY_REWRITE` env flag means the only thing that changes between the two runs is the one knob. Two numbers, one variable, story tells itself. Same pattern as `EVAL_STRATEGY` did for graph-augmented retrieval.

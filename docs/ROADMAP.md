@@ -25,7 +25,7 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [x] Relevance threshold filter on retrieved chunks (0.4) so chat replies conversationally on out-of-context queries instead of hallucinating "I don't have that"
 - [x] Sidebar slides in from the right on node-select; closes on background click
 
-## P2 — Smarter retrieval 🟢 ~70% shipped
+## P2 — Smarter retrieval 🟢 ~80% shipped
 
 **Learning goal:** Real retrieval engineering — chunking strategies, reranking, evals, graph-augmented retrieval, observability.
 
@@ -40,13 +40,13 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [x] **AI observability** — `chat_logs` table records one row per chat turn (question, answer, full prompt, cited node IDs, model meta, retrieval stats, per-stage timings, token counts, $ cost, status). New `/insights` page shows aggregates + per-row drill-down with the raw prompt. Originally planned for P4; pulled forward because debugging the gym-question hallucination needed it.
 - [x] **Edge weight visualization** — discrete color tiers (slate/cyan/amber by weight), legend in canvas corner, edge width + particle density modulated by weight. Force simulation tuned for spaced layout.
 - [x] **Unified add-memory flow** — single "+ Add memory ▸" button → dropdown → type-aware draft form rendered inside the sidebar (no modal layer). Save chains automatically: persist → embed → auto-connect → refresh edges. Zero clicks-to-connect.
+- [x] **Query rewriting for multi-turn** — one LLM call (gpt-4o-mini, JSON mode, temp 0) rewrites vague follow-ups into standalone search queries before embedding. Closes the ADR-014 weakness. Measured A/B on 20-case golden: recall@1 80→85%, MRR 0.885→0.910 with no regressions. Skipped on single-turn (zero added cost).
 
 ### Remaining (still P2)
 
 - [ ] **Hybrid retrieval** — vector + Postgres `tsvector` BM25-style fulltext, RRF-fused top-k. Catches exact-keyword matches (codenames, acronyms) that pure vector misses.
 - [ ] **Reranking** — LLM-as-reranker over top-N→top-K, OR cross-encoder. Measure with evals.
 - [ ] **Recursive token-aware chunking** that respects markdown headings + paragraph boundaries.
-- [ ] **Query rewriting for multi-turn** — one LLM call uses prior turns to rewrite vague follow-ups into self-contained search queries before embedding. Fixes the multi-turn weakness in ADR-014.
 - [ ] **Redis + arq** — ingestion moves off the request path into background jobs.
 
 ## P3 — Agents
@@ -100,4 +100,4 @@ After P1 ships, this should pass end-to-end (and does):
 
 15. Hybrid retrieval rescues queries that mention exact tokens not strongly captured by embeddings.
 16. Recursive chunker produces structurally-aware chunks for markdown-heavy content.
-17. Query rewriting lifts MRR on follow-up questions in the eval set.
+17. ✅ `EVAL_QUERY_REWRITE=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals` lifts MRR on multi-turn cases (`vague-partner`, `vague-her-age`) — measured 80→85% recall@1, 0.885→0.910 MRR.

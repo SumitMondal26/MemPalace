@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     # App
     api_cors_origins: str = "http://localhost:3000"
 
+    # Retrieval — flip to false to disable LLM query rewriting on multi-turn /chat.
+    # When true and the request carries history, one extra LLM call rewrites
+    # the user's question into a standalone search query before embedding.
+    query_rewrite_enabled: bool = True
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.api_cors_origins.split(",") if o.strip()]

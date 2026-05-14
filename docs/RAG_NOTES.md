@@ -98,6 +98,43 @@ No reranking yet. P2 will add hybrid retrieval (vector + BM25) and a cross-encod
 
 ---
 
+## Query rewriting (multi-turn)
+
+Multi-turn chat introduces an asymmetry: at *generation* time we send the last 6 messages so the LLM can resolve "she", "it", "the second one" from history. But at *retrieval* time we embed the user's latest message in isolation — the embedder is blind to that same history. So `"how old is she?"` retrieves whatever embedding for that exact 4-word string happens to land near, with zero signal that "she" means a specific entity from the prior turn.
+
+**Fix.** Before embedding, run one cheap LLM call (gpt-4o-mini, JSON mode, temp 0, max 120 tokens):
+
+```
+SYSTEM: rewrite the latest message into a standalone search query using prior turns when needed.
+USER:   prior conversation: <last 4 turns>
+        latest user message: how old is she?
+        return JSON only.
+→ {"query": "how old is Eijuuu?"}
+```
+
+Embed *that*. The user-visible question still goes into the prompt unchanged — the rewriter only steers retrieval, not generation.
+
+**Where it runs.** `apps/api/app/services/query_rewriter.py`, called from `routers/chat.py` as Stage 0. Gated on `settings.query_rewrite_enabled` AND `len(history) > 0` — single-turn skips the call.
+
+**A/B (20-case golden set, graph-augmented retrieval, k_max=10):**
+
+| metric    | rewrite OFF | rewrite ON |
+|-----------|-------------|------------|
+| recall@1  | 80%         | **85%**    |
+| recall@3  | 95%         | 95%        |
+| MRR       | 0.885       | **0.910**  |
+
+`vague-partner` flipped rank 2 → 1 (sim 0.234 → 0.552). `vague-her-age` was rank-1 already by accidental template-match but its similarity climbed 0.438 → 0.770 — same answer, much more confident.
+
+**Defensive design.** The rewriter has three failure modes that all share one fallback: if the LLM call fails, the JSON parse fails, or the model returns the wrong shape — return the original question. Never let the rewriter break the chat path.
+
+**Tradeoffs.**
+- +1 LLM round-trip on multi-turn turns (~300-1500ms latency, ~$0.0001).
+- Skipped on single-turn (zero added cost — the dominant case).
+- Could be parallelized with embed-of-original as a hedge, or gated on a pronoun heuristic at scale. Not yet needed.
+
+---
+
 ## Prompt assembly
 
 **Pattern:**

@@ -65,6 +65,7 @@ SUPABASE_URL = ENV.get("SUPABASE_URL", "").rstrip("/")
 SERVICE_KEY = ENV.get("SUPABASE_SERVICE_ROLE_KEY", "")
 OPENAI_KEY = ENV.get("OPENAI_API_KEY", "")
 EMBED_MODEL = ENV.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+CHAT_MODEL = ENV.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
 # Retrieval strategy: "match_chunks" (baseline, vector only) or
 # "match_chunks_with_neighbors" (graph-augmented). Override via env:
@@ -74,6 +75,25 @@ STRATEGY = os.environ.get(
 )
 NEIGHBOR_COUNT = int(
     os.environ.get("EVAL_NEIGHBOR_COUNT", ENV.get("EVAL_NEIGHBOR_COUNT", "1"))
+)
+
+# When true, run an LLM rewrite on cases that carry a `history` field, and
+# embed the rewritten query instead of the raw one. Mirrors the production
+# rewriter at apps/api/app/services/query_rewriter.py.
+QUERY_REWRITE = (
+    os.environ.get("EVAL_QUERY_REWRITE", ENV.get("EVAL_QUERY_REWRITE", "0")).lower()
+    in ("1", "true", "yes", "on")
+)
+
+REWRITE_SYSTEM_PROMPT = (
+    "You rewrite a user's latest message into a standalone search query for a "
+    "vector database, using the prior conversation only when needed.\n\n"
+    "Rules:\n"
+    "- If the latest message already names the subject, return it unchanged.\n"
+    "- If it uses pronouns or follow-up shorthand, rewrite it to name the "
+    "actual entity from the prior turns.\n"
+    "- Output ONLY a JSON object: {\"query\": \"...\"}.\n"
+    "- Keep it short.\n"
 )
 
 for name, val in (
@@ -129,6 +149,45 @@ def embed(question: str) -> list[float]:
     return resp["data"][0]["embedding"]
 
 
+def rewrite(question: str, history: list[dict]) -> str:
+    """Mirror of services.query_rewriter — standalone for eval harness.
+
+    Returns the rewritten query; falls back to `question` on any failure.
+    No-op when history is empty.
+    """
+    if not history:
+        return question
+    transcript = "\n".join(f"{m['role']}: {m['content']}" for m in history[-4:])
+    user_block = (
+        f"Prior conversation:\n{transcript}\n\n"
+        f"Latest user message: {question}\n\n"
+        f"Return JSON only."
+    )
+    try:
+        resp = post_json(
+            "https://api.openai.com/v1/chat/completions",
+            {
+                "model": CHAT_MODEL,
+                "messages": [
+                    {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_block},
+                ],
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"},
+                "max_tokens": 120,
+            },
+            {"Authorization": f"Bearer {OPENAI_KEY}"},
+        )
+        raw = resp["choices"][0]["message"]["content"] or ""
+        obj = json.loads(raw)
+        q = obj.get("query")
+        if isinstance(q, str) and q.strip():
+            return q.strip()
+    except Exception:
+        pass
+    return question
+
+
 def search_chunks(query_vec: list[float], k: int) -> list[dict]:
     payload: dict = {"query_embedding": query_vec, "match_count": k}
     if STRATEGY == "match_chunks_with_neighbors":
@@ -157,9 +216,14 @@ def run_case(case: dict, k_max: int, titles: dict[str, str]) -> dict:
     """Run a single eval case. Returns a dict with rank info + ranked titles."""
     q = case["question"]
     expected = {t.strip() for t in case["expected_node_titles"]}
+    history = case.get("history") or []
     t0 = time.perf_counter()
 
-    qvec = embed(q)
+    search_q = q
+    if QUERY_REWRITE and history:
+        search_q = rewrite(q, history)
+
+    qvec = embed(search_q)
     chunks = search_chunks(qvec, k_max)
 
     # Build ranked list of unique node titles (preserving rank order).
@@ -187,6 +251,7 @@ def run_case(case: dict, k_max: int, titles: dict[str, str]) -> dict:
     return {
         "id": case["id"],
         "question": q,
+        "search_question": search_q,
         "expected": sorted(expected),
         "ranked_titles": ranked_titles,
         "rank": rank,
@@ -216,6 +281,7 @@ def main() -> int:
         f"   {len(cases)} cases · k_max={k_max} · model={EMBED_MODEL} · "
         f"strategy={STRATEGY}"
         + (f" (neighbor_count={NEIGHBOR_COUNT})" if STRATEGY.endswith("neighbors") else "")
+        + (f" · query_rewrite=ON (chat_model={CHAT_MODEL})" if QUERY_REWRITE else "")
     )
     print()
 
@@ -257,6 +323,8 @@ def main() -> int:
             f"{r['id'][:28]:28} {rank_str:>5}  {sim_str:>6}  "
             f"{r['elapsed_ms']:>4}ms  {r['question']}"
         )
+        if r.get("search_question") and r["search_question"] != r["question"]:
+            print(f"{'':28} {'':>5}  {'':>6}  {'':>6}    ↳ rewrote → {r['search_question']!r}")
 
     # Aggregates
     n = len(results)

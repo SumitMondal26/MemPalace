@@ -78,14 +78,22 @@
     {
       "id": "vague-partner",
       "question": "tell me about my partner",
+      "history": [
+        {"role": "user", "content": "who is my girlfriend?"},
+        {"role": "assistant", "content": "Your girlfriend is Eijuuu."}
+      ],
       "expected_node_titles": ["Eijuuu", "Eijuuuu", "eijuuu's birthday", "eijuuuu likes"],
-      "notes": "Vague pronoun ('partner' instead of 'girlfriend'). Multi-node expected. Litmus test for query-rewriting (P2 remaining work) — current vector likely picks Eijuuu only."
+      "notes": "Vague pronoun ('partner' instead of 'girlfriend'). Multi-node expected. Litmus test for query-rewriting — without rewrite, current vector likely picks Eijuuu only."
     },
     {
       "id": "vague-her-age",
       "question": "how old is she?",
+      "history": [
+        {"role": "user", "content": "who is my girlfriend?"},
+        {"role": "assistant", "content": "Your girlfriend is Eijuuu."}
+      ],
       "expected_node_titles": ["Eijjuu", "eijuuu's birthday"],
-      "notes": "Pronoun-only question. Single-turn embedding has no context for 'she'. EXPECTED to fail under current setup; query rewriting + multi-turn would resolve."
+      "notes": "Pronoun-only question. Single-turn embedding has no context for 'she' — EXPECTED to fail without rewriting, EXPECTED to pass with it."
     },
     {
       "id": "cross-doc-ai-books",

@@ -96,13 +96,17 @@ User edits content → Save in Sidebar
                    → Sidebar shows "✓ N chunks indexed"
 ```
 
-## Data flow: chat (graph-augmented RAG, multi-turn, observed)
+## Data flow: chat (graph-augmented RAG, multi-turn, observed, rewriter)
 
 ```
 User question + prior 6 messages (history snapshot)
    → POST /chat (SSE response)
    → resolve workspace_id via supabase_user
-   → embed_query (OpenAI text-embedding-3-small)  → embed tokens captured
+   → IF history present AND settings.query_rewrite_enabled:
+       → rewrite_query (gpt-4o-mini, temp 0, JSON mode, max 120 tokens)
+       → emit SSE event: rewrite {original, rewritten, was_rewritten, elapsed_ms}
+       → search_question = rewrite_result.rewritten   (else: body.question)
+   → embed_query(search_question, OpenAI text-embedding-3-small)  → embed tokens captured
    → match_chunks_with_neighbors RPC:
        - top-k vector search (CTE: seed)
        - find seed nodes' 1-hop neighbors via edges (manual + semantic, undirected)
@@ -225,6 +229,7 @@ These should never break. If you change code that touches one, update this doc.
 9. **Every chat turn produces a chat_logs row.** Logging wrapped in try/except so it can never block the user response, but this is the substrate for /insights and any future observability work.
 10. **The auto-connect chain runs after every memory mutation.** Save a note → embed → rebuild-edges → refresh store. No "remember to click Auto-connect."
 11. **Conversation memory is local-only** (lives in ChatPanel's component state). No DB persistence. Capped at 6 messages at the API boundary.
+12. **Rewriter never blocks the chat path.** All failures (parse error, API timeout, junk JSON) silently fall back to the original question. The rewrite must be defensive — a broken rewriter = degraded retrieval, not a broken `/chat`.
 
 ## Open architectural questions (deferred)
 
