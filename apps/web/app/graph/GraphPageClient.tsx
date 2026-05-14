@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
@@ -159,9 +160,16 @@ export default function GraphPageClient({
               + {t}
             </button>
           ))}
+          <Link
+            href="/insights"
+            className="ml-2 rounded-lg px-3 py-1 text-xs text-neutral-400 ring-1 ring-palace-edge hover:bg-palace-panel hover:text-neutral-100"
+            title="LLM observability — costs, latency, prompts"
+          >
+            Insights
+          </Link>
           <button
             onClick={signOut}
-            className="ml-2 rounded-lg px-3 py-1 text-xs text-neutral-400 ring-1 ring-palace-edge hover:bg-palace-panel hover:text-neutral-100"
+            className="rounded-lg px-3 py-1 text-xs text-neutral-400 ring-1 ring-palace-edge hover:bg-palace-panel hover:text-neutral-100"
           >
             Sign out
           </button>

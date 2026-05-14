@@ -16,13 +16,20 @@ from supabase import Client
 from ..config import settings
 
 
-async def embed_query(openai: AsyncOpenAI, query: str) -> list[float]:
+async def embed_query(
+    openai: AsyncOpenAI,
+    query: str,
+    usage_out: dict | None = None,
+) -> list[float]:
+    """Embed a query. If usage_out is provided, mutate with token count."""
     if not query.strip():
         return []
     resp = await openai.embeddings.create(
         model=settings.openai_embedding_model,
         input=[query],
     )
+    if usage_out is not None and resp.usage:
+        usage_out["tokens"] = resp.usage.total_tokens
     return resp.data[0].embedding
 
 

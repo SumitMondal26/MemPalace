@@ -18,12 +18,27 @@ type Stage = {
   elapsed_ms: number;
 };
 
+type PromptInfo = {
+  messages: { role: string; content: string }[];
+  model: string;
+  temperature: number;
+};
+
+type DoneInfo = {
+  elapsed_ms: number;
+  embed_tokens?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cost_usd?: number;
+};
+
 type Message = {
   role: "user" | "assistant";
   content: string;
   sources?: Source[];
   trace?: Stage[];
-  doneMs?: number;
+  prompt?: PromptInfo;
+  done?: DoneInfo;
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -119,8 +134,12 @@ export default function ChatPanel() {
     mutateLastAssistant((m) => ({ ...m, sources }));
   }
 
-  function markDone(ms: number) {
-    mutateLastAssistant((m) => ({ ...m, doneMs: ms }));
+  function setPrompt(prompt: PromptInfo) {
+    mutateLastAssistant((m) => ({ ...m, prompt }));
+  }
+
+  function markDone(done: DoneInfo) {
+    mutateLastAssistant((m) => ({ ...m, done }));
   }
 
   async function consumeStream(body: ReadableStream<Uint8Array>) {
@@ -164,9 +183,10 @@ export default function ChatPanel() {
       setSources(payload as Source[]);
     } else if (event === "stage" && payload && typeof payload === "object") {
       pushStage(payload as Stage);
+    } else if (event === "prompt" && payload && typeof payload === "object") {
+      setPrompt(payload as PromptInfo);
     } else if (event === "done" && payload && typeof payload === "object") {
-      const obj = payload as { elapsed_ms?: number };
-      if (typeof obj.elapsed_ms === "number") markDone(obj.elapsed_ms);
+      markDone(payload as DoneInfo);
     }
   }
 
@@ -273,8 +293,9 @@ function AssistantTurn({
   isStreaming: boolean;
 }) {
   const trace = message.trace ?? [];
-  const isDone = message.doneMs != null;
+  const isDone = message.done != null;
   const [expandedI, setExpandedI] = useState<number | null>(null);
+  const [showPrompt, setShowPrompt] = useState(false);
 
   const expandedSource =
     expandedI != null
@@ -286,9 +307,22 @@ function AssistantTurn({
       {trace.length > 0 && (
         <Trace
           stages={trace}
-          doneMs={message.doneMs ?? null}
+          doneMs={message.done?.elapsed_ms ?? null}
           isLive={isStreaming && !isDone}
         />
+      )}
+
+      {message.done && (
+        <div className="flex flex-wrap gap-2 text-[10px] text-neutral-500">
+          {message.done.prompt_tokens != null && (
+            <span>
+              {message.done.prompt_tokens}+{message.done.completion_tokens ?? 0} tokens
+            </span>
+          )}
+          {message.done.cost_usd != null && (
+            <span>· ${message.done.cost_usd.toFixed(5)}</span>
+          )}
+        </div>
       )}
 
       <div className="inline-block max-w-[95%] whitespace-pre-wrap rounded-2xl bg-palace-bg px-3 py-2 text-sm leading-relaxed text-neutral-200 ring-1 ring-palace-edge">
@@ -365,6 +399,34 @@ function AssistantTurn({
               <div className="whitespace-pre-wrap">
                 {expandedSource.preview}
               </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {message.prompt && (
+        <div>
+          <button
+            onClick={() => setShowPrompt(!showPrompt)}
+            className="text-[10px] text-neutral-500 underline-offset-2 hover:text-neutral-300 hover:underline"
+          >
+            {showPrompt ? "▼ hide raw prompt" : "▶ view raw prompt"}
+          </button>
+          {showPrompt && (
+            <div className="mt-1 max-h-80 overflow-auto rounded-lg bg-palace-bg/90 p-3 text-[11px] leading-relaxed text-neutral-300 ring-1 ring-palace-edge">
+              <div className="mb-2 text-[9px] uppercase tracking-wider text-neutral-500">
+                {message.prompt.model} · temp {message.prompt.temperature}
+              </div>
+              {message.prompt.messages.map((m, i) => (
+                <div key={i} className="mb-2 border-l-2 border-palace-edge pl-2">
+                  <div className="text-[9px] font-semibold uppercase tracking-wider text-palace-accent">
+                    {m.role}
+                  </div>
+                  <div className="whitespace-pre-wrap text-neutral-300">
+                    {m.content}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </div>

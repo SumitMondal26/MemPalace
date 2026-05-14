@@ -1,13 +1,13 @@
-"""Streaming chat completion wrapper.
+"""Streaming chat completion wrapper + prompt assembly.
 
-Prompt structure (boring on purpose — fancier templating waits for measurable
-need):
-
-    [system]   Mem Palace assistant rules + citation convention
-    [user]     "Context:\n<numbered chunks>\n\nQuestion: <q>"
-
-The numbered tags ([1], [2], ...) align with the `sources` event the router
-emits before tokens, so the UI can resolve citations back to nodes.
+Split into:
+  - SYSTEM_PROMPT: the rules
+  - build_chat_messages(): pure function that assembles the messages array
+    (visible to /chat for emitting as an `event: prompt` SSE frame, and
+    for logging the exact payload sent to OpenAI).
+  - stream_chat_messages(): streams the LLM response. Optionally captures
+    OpenAI's token-usage report into a passed-in dict (in streaming mode you
+    must request it via stream_options={"include_usage": True}).
 """
 
 from collections.abc import AsyncIterator
@@ -31,18 +31,19 @@ Rules:
 """.strip()
 
 
-async def stream_chat(
-    openai: AsyncOpenAI,
+def build_chat_messages(
     question: str,
     chunks: list[dict],
     history: list[dict] | None = None,
-) -> AsyncIterator[str]:
+) -> list[dict]:
+    """Pure function. Returns the messages array to send to OpenAI.
+
+    Order: system → history (chronological) → current user turn with Context.
+    """
     context = (
         "\n\n".join(f"[{i + 1}] {c['content']}" for i, c in enumerate(chunks))
         or "(no context found in user memory)"
     )
-
-    # Order: system → prior turns (chronological) → current turn with Context.
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         messages.extend(history)
@@ -52,16 +53,45 @@ async def stream_chat(
             "content": f"Context:\n{context}\n\nQuestion: {question}",
         }
     )
+    return messages
 
+
+async def stream_chat_messages(
+    openai: AsyncOpenAI,
+    messages: list[dict],
+    usage_out: dict | None = None,
+) -> AsyncIterator[str]:
+    """Stream tokens from a chat completion.
+
+    If `usage_out` is provided, it gets mutated with `prompt_tokens` and
+    `completion_tokens` from OpenAI's usage report (only delivered at end-of-
+    stream when stream_options.include_usage is true).
+    """
     stream = await openai.chat.completions.create(
         model=settings.openai_chat_model,
         messages=messages,
         stream=True,
+        stream_options={"include_usage": True},
         temperature=0.2,
     )
     async for event in stream:
-        if not event.choices:
-            continue
-        delta = event.choices[0].delta.content
-        if delta:
-            yield delta
+        if event.choices:
+            delta = event.choices[0].delta.content
+            if delta:
+                yield delta
+        if event.usage and usage_out is not None:
+            usage_out["prompt_tokens"] = event.usage.prompt_tokens
+            usage_out["completion_tokens"] = event.usage.completion_tokens
+
+
+# Backward compatibility — older call sites that built messages internally.
+async def stream_chat(
+    openai: AsyncOpenAI,
+    question: str,
+    chunks: list[dict],
+    history: list[dict] | None = None,
+    usage_out: dict | None = None,
+) -> AsyncIterator[str]:
+    messages = build_chat_messages(question, chunks, history)
+    async for token in stream_chat_messages(openai, messages, usage_out):
+        yield token

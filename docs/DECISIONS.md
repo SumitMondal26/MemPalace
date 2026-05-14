@@ -80,6 +80,34 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-015 — AI observability: chat_logs table + /insights page
+
+**Date:** 2026-05-15
+
+**Context.** Until now, debugging the chat pipeline meant tailing FastAPI logs and squinting at console output. No way to ask "what was the most expensive request today?" or "why does this answer look wrong — what was actually in the prompt?" Real LLM apps have observability. We needed our own.
+
+**Decision.** Two pieces:
+
+1. **Prompt visibility in the chat panel** (Phase 1). The /chat handler emits a new SSE event `event: prompt` with the full messages array sent to OpenAI, the model, and the temperature. The ChatPanel captures it and shows an expandable "view raw prompt" panel under each assistant message. Lets the user (and us) see exactly what the LLM saw.
+
+2. **chat_logs table + /insights page** (Phase 2). A new Supabase table records one row per chat turn with: question, answer, full prompt array, cited node IDs, model + embed model, retrieval strategy + filter ratios, similarity range, history size, per-stage timings (embed/search/LLM), token counts (embed/prompt/completion via OpenAI's `stream_options.include_usage`), and computed $ cost from a per-model price table. RLS is workspace-scoped so users only see their own. A new `/insights` page renders aggregate cards (total cost, avg/p95 latency, empty-context rate), a per-stage timing breakdown bar, a list of recent requests with cost/latency/tokens at a glance, and a drill-down panel showing every captured field plus the raw prompt for the selected row.
+
+**Why build it ourselves rather than adopt Langfuse / Phoenix.** Learning value. The shape of an observability tool is something every AI engineer should understand from the inside. Migration to OpenTelemetry → external tool is straightforward later (~half a session swap; the chat_logs row maps almost 1:1 to OTel spans). Until then, we own the data, the schema, and the queries.
+
+**Consequence.**
+- Pro: Every chat turn now produces a complete debugging record. Bugs that used to be vibes ("this answer looks wrong") become reproducible — the prompt is right there.
+- Pro: Token + cost tracking from day one. Bill awareness is built into the project, not a future surprise.
+- Pro: Per-stage timing data accumulates over time → eventually drives data-driven optimization (e.g., "search is 60% of avg latency, focus there").
+- Pro: Privacy is workspace-scoped via RLS. No cross-user leak.
+- Con: One extra DB write per chat turn. Async, fire-and-forget, can't block the user response — wrapped in try/except.
+- Con: Storage grows unbounded. Add 30-day retention via a scheduled job in P3.
+- Con: Cost calculation hardcodes prices; needs maintenance as OpenAI rates change. Worth it for awareness, not worth a complex billing-API integration.
+- Con: The prompt event surfaces user-content to the browser. Fine for personal-use Mem Palace; for multi-tenant prod gate behind a debug flag.
+
+**Path:** P3 adds time-series charts (cost-over-time, latency histograms) and "top cited nodes" analytics. P3+ swaps to OpenTelemetry-via-Langfuse if multi-tenant ops become necessary.
+
+---
+
 ## ADR-014 — Multi-turn chat: client sends history, server caps it
 
 **Date:** 2026-05-14

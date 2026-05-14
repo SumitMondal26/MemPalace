@@ -149,6 +149,33 @@ This is **not** a changelog (those are version-anchored). This is a **learning l
 
 ---
 
+## 2026-05-15 — AI observability: prompt visibility + /insights page
+
+**Shipped:**
+- `event: prompt` SSE event from /chat carrying the full messages array sent to OpenAI. ChatPanel renders it as an expandable "view raw prompt" panel under each assistant message.
+- New `chat_logs` table (migration 0007) — workspace-scoped via RLS. One row per turn with question, answer, full prompt, cited node IDs, model metadata, retrieval stats, per-stage timings, token counts, $ cost, status.
+- /chat handler tracks `time.perf_counter()` per stage, captures token usage from OpenAI streaming (`stream_options.include_usage`), computes cost from a per-model price table, and writes the log row at the end (try/except so logging can never break user response).
+- New `/insights` page: aggregate cards (cost, latency, empty-context rate), stage-timing breakdown bar, recent-requests list, drill-down panel showing every captured field including the raw prompt for the selected row.
+- Header in `/graph` got an "Insights" link. Middleware extends auth gate to cover `/insights`.
+- `done` SSE event now carries token counts + cost so ChatPanel can show a small "X+Y tokens · $0.00012" line under each turn.
+- ADR-015 captures the design + rationale for building this in-house vs adopting Langfuse.
+
+**What I learned:**
+- **OpenAI streaming + token counts requires `stream_options.include_usage = true`.** Without it, the streaming response doesn't carry usage data and you have to estimate. With it, the final stream event carries `prompt_tokens` + `completion_tokens`. Same for embedding — the non-streaming response carries `usage.total_tokens` directly.
+- **Cost lookup tables age fast.** Hardcoding OpenAI prices in code means the doc page goes stale every quarter. Acceptable for a personal-learning project; production teams either query OpenAI's pricing API or accept staleness with periodic updates.
+- **Logging must never break the user response.** Wrapping the chat_logs INSERT in `try: except: pass` is the right call. A logging failure (e.g., DB temporarily unreachable) shouldn't surface as a chat error to the user.
+- **Build observability in-house first, then graduate to a vendor.** Building a chat_logs schema + /insights page makes you understand exactly what Langfuse/Phoenix store and why. Migration to OTel later is straightforward (chat_logs row → OTel span). Adopting the vendor first means you never understand the abstraction.
+- **The per-stage timing breakdown is gold.** When latency feels slow, you don't have to guess where — embed vs search vs LLM. Three numbers, sum to total. For our setup, LLM dominates (~60-70% of total).
+- **"Privacy via RLS" composes naturally.** chat_logs reuses the same workspace_id-scoped policy as everything else. No new security model to design.
+
+**Per-turn cost on our current usage** (gpt-4o-mini + text-embedding-3-small):
+  - Embed: ~10 tokens × $0.02/1M = ~$0.0000002 (basically free)
+  - Prompt: ~500-2000 tokens × $0.15/1M = ~$0.00007-0.0003
+  - Completion: ~50-200 tokens × $0.60/1M = ~$0.00003-0.00012
+  - **Total: ~$0.0001-0.0004 per chat turn** ≈ 1000-5000 turns per dollar.
+
+---
+
 ## 2026-05-14 — `adfea8b` — docs housekeeping
 
 **Shipped:**
