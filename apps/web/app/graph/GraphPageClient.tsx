@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
+import AddNodeMenu from "@/components/AddNodeMenu";
 import ChatPanel from "@/components/ChatPanel";
 import GraphCanvas from "@/components/GraphCanvas";
 import Sidebar from "@/components/Sidebar";
@@ -29,7 +30,6 @@ type Props = {
   initialEdges: DbEdge[];
 };
 
-const NODE_TYPES: NodeType[] = ["note", "doc", "url"];
 
 function LegendRow({
   color,
@@ -71,6 +71,8 @@ export default function GraphPageClient({
   const [fitTrigger, setFitTrigger] = useState(0);
   const [autoConnect, setAutoConnect] = useState<AutoConnectStatus>("idle");
   const [autoConnectMsg, setAutoConnectMsg] = useState<string>("");
+  const startDraft = useGraphStore((s) => s.startDraft);
+  const draftType = useGraphStore((s) => s.draftType);
 
   useEffect(() => {
     setInitial({
@@ -80,26 +82,25 @@ export default function GraphPageClient({
     });
   }, [workspaceId, initialNodes, initialEdges, setInitial]);
 
-  async function addNode(type: NodeType) {
+  /** Auto-connect handler usable from anywhere — buttons, post-save chains. */
+  async function runAutoConnect() {
+    setAutoConnect("running");
+    setAutoConnectMsg("");
     try {
-      const node = await db.createNode({
-        workspace_id: workspaceId,
-        type,
-        title:
-          type === "note"
-            ? "New thought"
-            : type === "doc"
-              ? "New doc"
-              : "New URL",
-        content: "",
-        // Positions are ignored by the 3D canvas (force-directed). Any value is fine.
-        x: 0,
-        y: 0,
-      });
-      upsertNode(node);
-      selectNode(node.id);
+      const res = await api<RebuildEdgesResponse>(
+        `/workspaces/${workspaceId}/rebuild-edges`,
+        { method: "POST" },
+      );
+      const fresh = await db.listEdges(workspaceId);
+      setEdges(fresh);
+      setAutoConnect("done");
+      setAutoConnectMsg(
+        `${res.edges_created} semantic edge${res.edges_created === 1 ? "" : "s"} created`,
+      );
+      setTimeout(() => setAutoConnect("idle"), 4000);
     } catch (e) {
-      console.error("createNode failed", e);
+      setAutoConnect("failed");
+      setAutoConnectMsg(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -111,29 +112,10 @@ export default function GraphPageClient({
 
   async function autoConnectGraph() {
     if (autoConnect === "running") return;
-    setAutoConnect("running");
-    setAutoConnectMsg("");
-    try {
-      const res = await api<RebuildEdgesResponse>(
-        `/workspaces/${workspaceId}/rebuild-edges`,
-        { method: "POST" },
-      );
-      // Refresh edges from DB into the store — RLS handles isolation.
-      const fresh = await db.listEdges(workspaceId);
-      setEdges(fresh);
-      setAutoConnect("done");
-      setAutoConnectMsg(
-        `${res.edges_created} semantic edge${res.edges_created === 1 ? "" : "s"} created`,
-      );
-      // Fade the chip after 4s
-      setTimeout(() => setAutoConnect("idle"), 4000);
-    } catch (e) {
-      setAutoConnect("failed");
-      setAutoConnectMsg(e instanceof Error ? e.message : String(e));
-    }
+    await runAutoConnect();
   }
 
-  const sidebarOpen = !!selectedNodeId;
+  const sidebarOpen = !!selectedNodeId || !!draftType;
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-palace-bg">
@@ -151,15 +133,7 @@ export default function GraphPageClient({
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {NODE_TYPES.map((t) => (
-            <button
-              key={t}
-              onClick={() => addNode(t)}
-              className="rounded-lg bg-palace-accent/10 px-3 py-1 text-xs font-medium text-palace-accent ring-1 ring-palace-accent/40 hover:bg-palace-accent/20"
-            >
-              + {t}
-            </button>
-          ))}
+          <AddNodeMenu onPick={(t) => startDraft(t)} />
           <Link
             href="/insights"
             className="ml-2 rounded-lg px-3 py-1 text-xs text-neutral-400 ring-1 ring-palace-edge hover:bg-palace-panel hover:text-neutral-100"

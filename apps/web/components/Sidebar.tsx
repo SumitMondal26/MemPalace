@@ -1,23 +1,50 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
 import * as db from "@/lib/db";
-import type { DbUpload } from "@/lib/db";
+import type { DbUpload, NodeType } from "@/lib/db";
 import { useGraphStore } from "@/lib/store";
 import UploadDropzone from "./UploadDropzone";
 
 type IndexStatus = "idle" | "indexing" | "indexed" | "failed";
+
+const DRAFT_COPY: Record<
+  NodeType,
+  { heading: string; sub: string; cta: string }
+> = {
+  note: {
+    heading: "New note",
+    sub: "A thought, fact, or snippet. Embedded immediately on save.",
+    cta: "Create note",
+  },
+  doc: {
+    heading: "New document",
+    sub: "Pick a title now. Upload the file once the node is created.",
+    cta: "Create document",
+  },
+  url: {
+    heading: "New URL",
+    sub: "Save a link with optional notes. (Auto-fetch + summarize is P2.)",
+    cta: "Save URL",
+  },
+  cluster: { heading: "Cluster", sub: "P3.", cta: "Create" },
+  image: { heading: "Image", sub: "P3.", cta: "Create" },
+};
 
 export default function Sidebar() {
   const selectedId = useGraphStore((s) => s.selectedNodeId);
   const node = useGraphStore((s) =>
     selectedId ? s.nodes.find((n) => n.id === selectedId) : undefined,
   );
+  const draftType = useGraphStore((s) => s.draftType);
+  const workspaceId = useGraphStore((s) => s.workspaceId);
   const upsertNode = useGraphStore((s) => s.upsertNode);
   const removeNode = useGraphStore((s) => s.removeNode);
   const selectNode = useGraphStore((s) => s.selectNode);
+  const cancelDraft = useGraphStore((s) => s.cancelDraft);
+  const setEdges = useGraphStore((s) => s.setEdges);
 
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
@@ -78,9 +105,22 @@ export default function Sidebar() {
     api<{ chunks_created: number }>(`/nodes/${nodeId}/embed`, {
       method: "POST",
     })
-      .then((res) => {
+      .then(async (res) => {
         setIndexStatus("indexed");
         setChunkCount(res.chunks_created);
+        // Auto-connect once new chunks exist — keeps the graph fresh without
+        // requiring the user to remember to click the button.
+        if (node?.workspace_id) {
+          try {
+            await api(`/workspaces/${node.workspace_id}/rebuild-edges`, {
+              method: "POST",
+            });
+            const fresh = await db.listEdges(node.workspace_id);
+            setEdges(fresh);
+          } catch (e) {
+            console.warn("auto-connect after embed failed", e);
+          }
+        }
         // chip auto-fades to idle after 4s
         setTimeout(() => setIndexStatus("idle"), 4000);
       })
@@ -127,6 +167,21 @@ export default function Sidebar() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+  }
+
+  if (draftType && workspaceId) {
+    return (
+      <DraftForm
+        type={draftType}
+        workspaceId={workspaceId}
+        onCreated={(newNode) => {
+          upsertNode(newNode);
+          selectNode(newNode.id);
+        }}
+        onCancel={cancelDraft}
+        setEdges={setEdges}
+      />
+    );
   }
 
   if (!node) {
@@ -255,9 +310,22 @@ export default function Sidebar() {
               nodeId={node.id}
               existing={upload}
               existingChunkCount={chunkCount ?? 0}
-              onProcessed={() => {
-                // Refresh both upload row + chunk count after a successful ingest.
-                refreshState();
+              onProcessed={async () => {
+                // Refresh upload + chunk count, then auto-connect the graph
+                // since new chunks just landed.
+                await refreshState();
+                if (node.workspace_id) {
+                  try {
+                    await api(
+                      `/workspaces/${node.workspace_id}/rebuild-edges`,
+                      { method: "POST" },
+                    );
+                    const fresh = await db.listEdges(node.workspace_id);
+                    setEdges(fresh);
+                  } catch (e) {
+                    console.warn("auto-connect after ingest failed", e);
+                  }
+                }
               }}
             />
           </div>
@@ -287,6 +355,174 @@ export default function Sidebar() {
           </button>
         </div>
       </footer>
+    </aside>
+  );
+}
+
+/**
+ * Type-aware new-node form rendered inside the sidebar slot.
+ * Submitting persists the node, selects it (which transitions the sidebar
+ * to edit-mode), then fires embed + auto-connect in the background.
+ */
+function DraftForm({
+  type,
+  workspaceId,
+  onCreated,
+  onCancel,
+  setEdges,
+}: {
+  type: NodeType;
+  workspaceId: string;
+  onCreated: (n: db.DbNode) => void;
+  onCancel: () => void;
+  setEdges: (edges: db.DbEdge[]) => void;
+}) {
+  const copy = DRAFT_COPY[type];
+  const [title, setTitle] = useState("");
+  const [content, setContent] = useState("");
+  const [url, setUrl] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const titleRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    titleRef.current?.focus();
+  }, []);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!title.trim()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      let assembledContent = content.trim();
+      if (type === "url") {
+        const u = url.trim();
+        assembledContent = assembledContent ? `${u}\n\n${assembledContent}` : u;
+      }
+
+      const node = await db.createNode({
+        workspace_id: workspaceId,
+        type,
+        title: title.trim(),
+        content: assembledContent,
+        x: 0,
+        y: 0,
+      });
+      onCreated(node);
+
+      // Background: embed (if there's content) → auto-connect → refresh edges.
+      if ((type === "note" || type === "url") && assembledContent) {
+        try {
+          await api(`/nodes/${node.id}/embed`, { method: "POST" });
+          await api(`/workspaces/${workspaceId}/rebuild-edges`, {
+            method: "POST",
+          });
+          const fresh = await db.listEdges(workspaceId);
+          setEdges(fresh);
+        } catch (e) {
+          console.warn("post-create embed/auto-connect failed", e);
+        }
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setSaving(false);
+    }
+  }
+
+  return (
+    <aside className="flex h-full flex-col border-l border-palace-edge bg-palace-panel/95 shadow-2xl backdrop-blur-md">
+      <header className="border-b border-palace-edge p-4">
+        <div className="text-[10px] font-semibold uppercase tracking-wider text-palace-accent">
+          DRAFT · {type}
+        </div>
+        <div className="mt-1 text-base font-semibold text-neutral-100">
+          {copy.heading}
+        </div>
+        <div className="mt-1 text-xs text-neutral-500">{copy.sub}</div>
+      </header>
+
+      <form onSubmit={submit} className="flex flex-1 flex-col">
+        <div className="flex-1 space-y-3 overflow-auto p-4">
+          <label className="block text-xs font-medium text-neutral-400">
+            Title
+            <input
+              ref={titleRef}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder={
+                type === "doc"
+                  ? "e.g. attention is all you need"
+                  : type === "url"
+                    ? "e.g. RFC 7159 (JSON spec)"
+                    : "e.g. interview notes"
+              }
+              className="mt-1 w-full rounded-lg bg-palace-bg px-3 py-2 text-sm text-neutral-100 outline-none ring-1 ring-palace-edge focus:ring-palace-accent"
+            />
+          </label>
+
+          {type === "url" && (
+            <label className="block text-xs font-medium text-neutral-400">
+              URL
+              <input
+                type="url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://..."
+                className="mt-1 w-full rounded-lg bg-palace-bg px-3 py-2 text-sm text-neutral-100 outline-none ring-1 ring-palace-edge focus:ring-palace-accent"
+              />
+            </label>
+          )}
+
+          {type !== "doc" && (
+            <label className="block text-xs font-medium text-neutral-400">
+              {type === "url" ? "Notes (optional)" : "Content"}
+              <textarea
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                rows={type === "url" ? 4 : 10}
+                placeholder={
+                  type === "url"
+                    ? "Why this URL matters, what to remember about it..."
+                    : "What's on your mind?"
+                }
+                className="mt-1 w-full resize-none rounded-lg bg-palace-bg px-3 py-2 text-sm text-neutral-100 outline-none ring-1 ring-palace-edge focus:ring-palace-accent"
+              />
+            </label>
+          )}
+
+          {type === "doc" && (
+            <p className="rounded-md bg-palace-bg/70 p-3 text-xs text-neutral-500 ring-1 ring-palace-edge">
+              Once created, you&rsquo;ll see a file-upload area here. Pick a
+              PDF or text file — it&rsquo;ll be chunked, embedded, and
+              auto-connected to related nodes.
+            </p>
+          )}
+
+          {error && (
+            <p className="rounded-md bg-red-950/40 px-3 py-2 text-xs text-red-300">
+              {error}
+            </p>
+          )}
+        </div>
+
+        <footer className="flex items-center justify-end gap-2 border-t border-palace-edge p-4">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded-lg px-3 py-1.5 text-xs text-neutral-400 ring-1 ring-palace-edge hover:bg-palace-bg"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={saving || !title.trim() || (type === "url" && !url.trim())}
+            className="rounded-lg bg-palace-accent px-4 py-1.5 text-xs font-medium text-white hover:bg-palace-accent/90 disabled:opacity-50"
+          >
+            {saving ? "..." : copy.cta}
+          </button>
+        </footer>
+      </form>
     </aside>
   );
 }

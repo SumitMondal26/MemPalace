@@ -12,13 +12,15 @@
  */
 
 import { create } from "zustand";
-import type { DbEdge, DbNode } from "./db";
+import type { DbEdge, DbNode, NodeType } from "./db";
 
 type State = {
   workspaceId: string | null;
   nodes: DbNode[];
   edges: DbEdge[];
   selectedNodeId: string | null;
+  /** When set, the sidebar renders a new-node form for this type. */
+  draftType: NodeType | null;
 };
 
 type Actions = {
@@ -33,6 +35,8 @@ type Actions = {
   removeEdge: (id: string) => void;
   setEdges: (edges: DbEdge[]) => void;
   selectNode: (id: string | null) => void;
+  startDraft: (type: NodeType) => void;
+  cancelDraft: () => void;
 };
 
 export const useGraphStore = create<State & Actions>((set) => ({
@@ -40,6 +44,7 @@ export const useGraphStore = create<State & Actions>((set) => ({
   nodes: [],
   edges: [],
   selectedNodeId: null,
+  draftType: null,
 
   setInitial: ({ workspaceId, nodes, edges }) =>
     set({ workspaceId, nodes, edges }),
@@ -78,5 +83,11 @@ export const useGraphStore = create<State & Actions>((set) => ({
 
   setEdges: (edges) => set({ edges }),
 
-  selectNode: (id) => set({ selectedNodeId: id }),
+  // Selecting a node always clears any in-progress draft (mutually exclusive).
+  selectNode: (id) => set({ selectedNodeId: id, draftType: null }),
+
+  // Starting a draft clears any existing selection.
+  startDraft: (type) => set({ draftType: type, selectedNodeId: null }),
+
+  cancelDraft: () => set({ draftType: null }),
 }));
