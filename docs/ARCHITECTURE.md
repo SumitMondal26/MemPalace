@@ -96,7 +96,7 @@ User edits content → Save in Sidebar
                    → Sidebar shows "✓ N chunks indexed"
 ```
 
-## Data flow: chat (graph-augmented RAG, multi-turn, observed, rewriter)
+## Data flow: chat (graph-augmented RAG, multi-turn, observed, rewriter, reranker)
 
 ```
 User question + prior 6 messages (history snapshot)
@@ -107,12 +107,19 @@ User question + prior 6 messages (history snapshot)
        → emit SSE event: rewrite {original, rewritten, was_rewritten, elapsed_ms}
        → search_question = rewrite_result.rewritten   (else: body.question)
    → embed_query(search_question, OpenAI text-embedding-3-small)  → embed tokens captured
-   → match_chunks_with_neighbors RPC:
+   → match_chunks_with_neighbors RPC:    (over-fetch 2× body.k when rerank ON)
        - top-k vector search (CTE: seed)
        - find seed nodes' 1-hop neighbors via edges (manual + semantic, undirected)
        - top-N chunks per neighbor node, ranked by query similarity
        - union seed + neighbor chunks, source-labeled, ordered seeds-first
    → filter chunks where similarity < 0.4 (RELEVANCE_THRESHOLD)
+   → IF settings.rerank_enabled AND len(candidates) ≥ 1:
+       → rerank_chunks (gpt-4o-mini, JSON mode, max 80 tokens, top-N=8)
+           - skip when len(candidates) < 2 OR top sim - 2nd sim > 0.10
+           - on success: reorder candidates by judge's ranked indices
+           - on failure: fall back to original order
+       → emit SSE event: rerank {was_reranked, skip_reason, elapsed_ms, movement}
+   → trim to body.k chunks
    → emit SSE event: sources [{i, id, node_id, similarity, source, preview}]
    → build prompt = system + history (capped 6) + current user-with-Context
    → emit SSE event: prompt {messages, model, temperature}    ← debug surface
@@ -230,6 +237,8 @@ These should never break. If you change code that touches one, update this doc.
 10. **The auto-connect chain runs after every memory mutation.** Save a note → embed → rebuild-edges → refresh store. No "remember to click Auto-connect."
 11. **Conversation memory is local-only** (lives in ChatPanel's component state). No DB persistence. Capped at 6 messages at the API boundary.
 12. **Rewriter never blocks the chat path.** All failures (parse error, API timeout, junk JSON) silently fall back to the original question. The rewrite must be defensive — a broken rewriter = degraded retrieval, not a broken `/chat`.
+13. **Reranker never blocks the chat path either.** Same defensive pattern as the rewriter — every failure (parse error, missing/wrong indices, API error) returns the original ordering. A broken reranker degrades to "no rerank," not to "no chat."
+14. **Reranking only fires on ambiguity.** When the top vector candidate's similarity is more than 0.10 above the second, we skip the rerank call. The cost guard preserves the cheap-when-easy property of the pipeline — reranking is paid only when it can actually help.
 
 ## Open architectural questions (deferred)
 

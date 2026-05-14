@@ -299,3 +299,30 @@ This is **not** a changelog (those are version-anchored). This is a **learning l
 - **Defensive LLM calls are different from defensive HTTP calls.** The rewriter has *three* failure modes that all need the same fallback (parse junk, API timeout, model returns wrong shape) — in every case, return the original question. Never let an auxiliary LLM call break the user's main flow.
 - **JSON mode (`response_format={"type": "json_object"}`) is cheaper than parsing prose.** Combined with temperature 0 and a short max_tokens cap, the rewriter is bounded in cost AND output shape. This is how production LLM transformations look — not "ask nicely and pray."
 - **Same-pipeline A/B is the cleanest experimental design.** The `EVAL_QUERY_REWRITE` env flag means the only thing that changes between the two runs is the one knob. Two numbers, one variable, story tells itself. Same pattern as `EVAL_STRATEGY` did for graph-augmented retrieval.
+
+---
+
+## 2026-05-15 — `(this commit)` — LLM-as-judge reranker (P2 closer #2)
+
+**Shipped:**
+- `services/reranker.py` — async, LLM-as-judge over top-N candidates. JSON output mode, temp 0, max 80 tokens. Auto-skips on clear winner (sim gap > 0.10), <2 candidates, or parse failure. Returns `RerankResult` with movement map for /insights drill-down.
+- `/chat` over-fetches 2× body.k from retrieval, threshold-filters, reranks → top-K. New `rerank` SSE event for the UI. Stage label "Reranking candidates by relevance" added to the trace.
+- Migration `0009` adds `rerank_was_reranked / rerank_skip_reason / rerank_ms / rerank_tokens_in/out / rerank_cost_usd` to chat_logs.
+- Eval harness: `EVAL_RERANK=1` flag mirrors production reranker. Banner shows rerank state.
+- New golden case `single-turn-pronoun-he` captures the live UI failure (chunks at sim 0.45 vs 0.44).
+- Docs: ADR-018, ARCHITECTURE invariants #13/#14, RAG_NOTES section, ROADMAP P2 → ~90%.
+
+**Measured (rewrite-only → rewrite+rerank):**
+- recall@1 85.71% → **95.24%** (+9.5pp)
+- recall@3 95.24% → **100.00%**
+- recall@5 100% → 100% (already saturated)
+- MRR 0.914 → **0.976** (+0.062)
+
+Cases that moved to rank 1: `personal-relationship-japane` ("kenojo") was rank 5, `girlfriend-birthday` was rank 2. The `single-turn-pronoun-he` retrieval was already rank 1 in the eval — the live UI bug was the LLM picking [2] over [1] in a near-tie. The reranker's job there is to widen the gap by promoting the right chunk explicitly, which is what eval ranks can't show but /insights can.
+
+**What I learned:**
+- **Recall and precision are different problems with different fixes.** Vector retrieval (recall) gets the right chunks *somewhere* in the candidate list. Reranker (precision) makes sure the *right one is at the top*. The first three layers of the stack (vector + graph + threshold) all optimize recall. The reranker is the first precision-side fix in the project.
+- **LLM-as-judge is a real production pattern, not a placeholder for "the real reranker."** Cross-encoders are faster per call but need ML deps + model download + weight management. For sub-1k QPS, an LLM call in the chat pipeline is fine and the dev velocity tradeoff is huge.
+- **Cost guards matter as much as the feature itself.** The skip-on-clear-winner gate (sim gap > 0.10) means simple lookups don't pay for the rerank. Without it the reranker would burn $0.0001/turn on questions where vector retrieval already had the right answer locked in. Always design the skip case alongside the active case.
+- **Eval can't see all the wins.** The rerank fixed the live UI failure (LLM picking the wrong near-tie), but the eval would have shown that case as already-rank-1. Two separate quality dimensions: "is the right chunk in the candidate list?" (recall) and "does the LLM cite the right chunk?" (faithfulness). The latter needs an LLM-as-judge eval — that's a P4 item.
+- **Over-fetch is the unsung enabler of every reranker.** Without it (`fetch_k = body.k * 2 if rerank_enabled else body.k`), the reranker would just be reordering the same 5 chunks vector retrieval was going to send anyway. The win comes from giving it candidates 6-10 to potentially promote.

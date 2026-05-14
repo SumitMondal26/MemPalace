@@ -85,6 +85,17 @@ QUERY_REWRITE = (
     in ("1", "true", "yes", "on")
 )
 
+# When true, over-fetch (2 * k_max) and run an LLM-as-judge reranker that
+# reorders candidates by relevance to the question. Mirrors the production
+# reranker at apps/api/app/services/reranker.py — same prompt, same skip
+# rules (gap > 0.10, < 2 candidates).
+RERANK = (
+    os.environ.get("EVAL_RERANK", ENV.get("EVAL_RERANK", "0")).lower()
+    in ("1", "true", "yes", "on")
+)
+RERANK_AMBIGUITY_GAP = 0.10
+RERANK_MAX_CANDIDATES = 8
+
 REWRITE_SYSTEM_PROMPT = (
     "You rewrite a user's latest message into a standalone search query for a "
     "vector database, using the prior conversation only when needed.\n\n"
@@ -94,6 +105,20 @@ REWRITE_SYSTEM_PROMPT = (
     "actual entity from the prior turns.\n"
     "- Output ONLY a JSON object: {\"query\": \"...\"}.\n"
     "- Keep it short.\n"
+)
+
+RERANK_SYSTEM_PROMPT = (
+    "You re-rank retrieved memory chunks for a user's question.\n\n"
+    "You receive a question and a numbered list of candidate chunks. Your job "
+    "is to return the chunks ordered from MOST useful for answering the "
+    "question to LEAST useful.\n\n"
+    "Rules:\n"
+    "- Read each chunk in full.\n"
+    "- Prefer chunks that DIRECTLY answer the question.\n"
+    "- For pronoun questions ('he', 'she'), match gender/identity from the "
+    "chunks themselves.\n"
+    "- Output ONLY a JSON object: {\"ranked\": [<integer indices>]}. The list "
+    "must contain every input index exactly once.\n"
 )
 
 for name, val in (
@@ -147,6 +172,58 @@ def embed(question: str) -> list[float]:
         {"Authorization": f"Bearer {OPENAI_KEY}"},
     )
     return resp["data"][0]["embedding"]
+
+
+def rerank(question: str, candidates: list[dict]) -> list[dict]:
+    """Mirror of services.reranker — standalone for eval harness.
+
+    Returns the candidates reordered. Skips when too few candidates, clear
+    winner (gap > 0.10), or any LLM/parse failure → original order.
+    """
+    if len(candidates) < 2:
+        return candidates
+    sims = [(c.get("similarity") or 0.0) for c in candidates]
+    if (sims[0] - sims[1]) > RERANK_AMBIGUITY_GAP:
+        return candidates
+
+    sent = candidates[:RERANK_MAX_CANDIDATES]
+    n = len(sent)
+    lines = []
+    for i, c in enumerate(sent):
+        preview = (c.get("content") or "")[:400].replace("\n", " ")
+        lines.append(f"[{i}] {preview}")
+    user_block = (
+        f"Question: {question}\n\n"
+        f"Candidates:\n" + "\n".join(lines) + "\n\n"
+        f"Return JSON: {{\"ranked\": [<indices in best-to-worst order>]}}"
+    )
+    try:
+        resp = post_json(
+            "https://api.openai.com/v1/chat/completions",
+            {
+                "model": CHAT_MODEL,
+                "messages": [
+                    {"role": "system", "content": RERANK_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_block},
+                ],
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"},
+                "max_tokens": 80,
+            },
+            {"Authorization": f"Bearer {OPENAI_KEY}"},
+        )
+        raw = resp["choices"][0]["message"]["content"] or ""
+        obj = json.loads(raw)
+        ranked = obj.get("ranked")
+        if not isinstance(ranked, list):
+            return candidates
+        as_ints = [int(x) for x in ranked]
+        if len(as_ints) != n or set(as_ints) != set(range(n)):
+            return candidates
+        reordered = [sent[i] for i in as_ints]
+        return reordered + candidates[RERANK_MAX_CANDIDATES:]
+    except Exception:
+        return candidates
 
 
 def rewrite(question: str, history: list[dict]) -> str:
@@ -224,7 +301,11 @@ def run_case(case: dict, k_max: int, titles: dict[str, str]) -> dict:
         search_q = rewrite(q, history)
 
     qvec = embed(search_q)
-    chunks = search_chunks(qvec, k_max)
+    # Over-fetch when reranker is on, then reorder + trim to k_max.
+    fetch_k = k_max * 2 if RERANK else k_max
+    chunks = search_chunks(qvec, fetch_k)
+    if RERANK:
+        chunks = rerank(search_q, chunks)[:k_max]
 
     # Build ranked list of unique node titles (preserving rank order).
     ranked_titles: list[tuple[str, float | None]] = []
@@ -281,7 +362,9 @@ def main() -> int:
         f"   {len(cases)} cases · k_max={k_max} · model={EMBED_MODEL} · "
         f"strategy={STRATEGY}"
         + (f" (neighbor_count={NEIGHBOR_COUNT})" if STRATEGY.endswith("neighbors") else "")
-        + (f" · query_rewrite=ON (chat_model={CHAT_MODEL})" if QUERY_REWRITE else "")
+        + (f" · query_rewrite=ON" if QUERY_REWRITE else "")
+        + (f" · rerank=ON" if RERANK else "")
+        + (f" (chat_model={CHAT_MODEL})" if (QUERY_REWRITE or RERANK) else "")
     )
     print()
 

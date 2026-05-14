@@ -25,7 +25,7 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [x] Relevance threshold filter on retrieved chunks (0.4) so chat replies conversationally on out-of-context queries instead of hallucinating "I don't have that"
 - [x] Sidebar slides in from the right on node-select; closes on background click
 
-## P2 — Smarter retrieval 🟢 ~80% shipped
+## P2 — Smarter retrieval 🟢 ~90% shipped
 
 **Learning goal:** Real retrieval engineering — chunking strategies, reranking, evals, graph-augmented retrieval, observability.
 
@@ -41,11 +41,11 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [x] **Edge weight visualization** — discrete color tiers (slate/cyan/amber by weight), legend in canvas corner, edge width + particle density modulated by weight. Force simulation tuned for spaced layout.
 - [x] **Unified add-memory flow** — single "+ Add memory ▸" button → dropdown → type-aware draft form rendered inside the sidebar (no modal layer). Save chains automatically: persist → embed → auto-connect → refresh edges. Zero clicks-to-connect.
 - [x] **Query rewriting for multi-turn** — one LLM call (gpt-4o-mini, JSON mode, temp 0) rewrites vague follow-ups into standalone search queries before embedding. Closes the ADR-014 weakness. Measured A/B on 20-case golden: recall@1 80→85%, MRR 0.885→0.910 with no regressions. Skipped on single-turn (zero added cost).
+- [x] **Reranking (LLM-as-judge)** — over-fetch 2× from retrieval, then send top-N (max 8) candidates + question to gpt-4o-mini with JSON output mode, get back ranked indices, reorder, take top-K. Auto-skips on clear winner (similarity gap > 0.10) and on parse/API failure. Measured A/B on 21-case golden: recall@1 85.71→**95.24%** (+9.5pp), MRR 0.914→**0.976** (+0.062). Three cases flipped to rank 1 (kenojo from rank 5!).
 
 ### Remaining (still P2)
 
-- [ ] **Hybrid retrieval** — vector + Postgres `tsvector` BM25-style fulltext, RRF-fused top-k. Catches exact-keyword matches (codenames, acronyms) that pure vector misses.
-- [ ] **Reranking** — LLM-as-reranker over top-N→top-K, OR cross-encoder. Measure with evals.
+- [ ] **Hybrid retrieval** — vector + Postgres `tsvector` BM25-style fulltext, RRF-fused top-k. Catches exact-keyword matches (codenames, acronyms) that pure vector misses. The one remaining miss in the golden set (`personal-gym`) is exactly this case.
 - [ ] **Recursive token-aware chunking** that respects markdown headings + paragraph boundaries.
 - [ ] **Redis + arq** — ingestion moves off the request path into background jobs.
 
@@ -101,3 +101,4 @@ After P1 ships, this should pass end-to-end (and does):
 15. Hybrid retrieval rescues queries that mention exact tokens not strongly captured by embeddings.
 16. Recursive chunker produces structurally-aware chunks for markdown-heavy content.
 17. ✅ `EVAL_QUERY_REWRITE=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals` lifts MRR on multi-turn cases (`vague-partner`, `vague-her-age`) — measured 80→85% recall@1, 0.885→0.910 MRR.
+18. ✅ `EVAL_QUERY_REWRITE=1 EVAL_RERANK=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals` lifts recall@1 to **95.24%** and MRR to **0.976**. Reranker explicitly resolves near-tie cases the embedder couldn't.

@@ -80,6 +80,68 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-018 — LLM-as-judge reranker (P2 closer #2)
+
+**Date:** 2026-05-15
+
+**Context.** Caught live in /insights: a single-turn question *"how old is he ?"* returned `[1] sumit's age @ 0.45` and `[2] Eijjuu's age @ 0.44` — a 1-percentage-point similarity gap. The LLM picked `[2]` and confidently answered "Eijjuu is 25 years old." Two failures stacked:
+1. **Vector retrieval can't see pronoun gender.** "How old is he?" is geometrically near any "how old is X" template chunk, regardless of gender of the subject.
+2. **The downstream LLM gets two near-tied chunks and picks one.** With no signal that one is more relevant than the other, the choice is essentially arbitrary.
+
+Query rewriting (ADR-017) couldn't help: there was no history to disambiguate "he". This was a precision problem at the candidate-list level, not a recall problem.
+
+**Decision.** Add an LLM-as-judge reranker between vector retrieval and prompt assembly. New service [apps/api/app/services/reranker.py](apps/api/app/services/reranker.py). Pipeline becomes:
+
+```
+embed → search_chunks_with_neighbors (over-fetch 2× k_max)
+      → threshold filter (sim ≥ 0.4)
+      → reranker: send top-N (max 8) + question to gpt-4o-mini, JSON mode,
+        get {"ranked": [<indices>]}, reorder, take top-K
+      → prompt builder
+```
+
+Auto-skip when:
+- Fewer than 2 candidates (nothing to rerank).
+- Top similarity > 0.10 above second (clear winner — don't pay).
+- Parse failure or API error (fall back to original order).
+
+Defensive: every failure path returns the original order trimmed to top_k. The reranker, like the rewriter, can never break /chat.
+
+**Why LLM-as-judge over a cross-encoder.** Cross-encoders (`bge-reranker-base`, etc.) are faster per call (~50ms) and free per call after the model download (~400MB). But they need a Python ML dep + model download in the API container, and the team doesn't have a measured need for the latency yet. LLM-as-judge ships in zero infra changes for ~$0.0001/turn. Easy to swap to a cross-encoder later if cost or latency demands.
+
+**Why JSON mode + temperature 0 + max_tokens 80.** Same pattern as the rewriter — bound the output shape, the cost ceiling, and the determinism. The judge's job is a transformation, not a creative task.
+
+**Measured (21-case golden set, graph-augmented retrieval, k_max=10, query rewriting ON):**
+
+| metric    | rerank OFF | rerank ON |
+|-----------|------------|-----------|
+| recall@1  | 85.71%     | **95.24%** (+9.5pp) |
+| recall@3  | 95.24%     | **100.00%** |
+| recall@5  | 100%       | 100%      |
+| MRR       | 0.914      | **0.976** (+0.062) |
+
+Three cases flipped to rank 1:
+- `personal-relationship-japane` ("kenojo"): rank 5 → 1
+- `girlfriend-birthday`: rank 2 → 1
+- `single-turn-pronoun-he`: rank 1 stayed but the reranker explicitly chose `sumit's age` over `Eijjuu's age`, which was the live failure mode in the UI.
+
+Only `personal-gym` still misses (rank 2). Hybrid retrieval (next P2 item) targets exactly that case (literal "PPL split" in chunk).
+
+**Cost & latency.** ~$0.0001 per chat turn that runs the rerank. ~500-2500ms added latency on those turns (most of the variance comes from prompt size — top-8 candidates with 400-char previews each = ~1000 input tokens). The skip-on-clear-winner gate means simple lookups don't pay either.
+
+**Consequence.**
+- Pro: Closes the live "how old is he?" failure plus several near-tie cases the team didn't know about (kenojo at rank 5 was eye-opening).
+- Pro: +9.5pp recall@1 / +0.062 MRR is the largest single-PR retrieval lift in the project's history. Makes the "evals don't lie" story concrete in interviews.
+- Pro: Reranker can be flipped off via `RERANK_ENABLED=false` env var if cost ever matters more than precision.
+- Pro: Logs are observable — `rerank_was_reranked`, `rerank_skip_reason`, `rerank_ms`, cost split out so /insights can show "this answer was rescued by rerank."
+- Con: +1 LLM round-trip on every chat turn that doesn't auto-skip. ~500-2500ms added latency. Acceptable for personal use; would justify a cross-encoder swap at scale.
+- Con: Reranker prompt is 1000-1500 tokens. At enterprise scale this dominates the cost envelope; budget before turning on for every workspace.
+- Con: We over-fetch 2× from retrieval to give the reranker more candidates. Doubles the SQL work per chat. Negligible at current scale; would matter past 1M chunks.
+
+**Future work.** When hybrid retrieval lands, the reranker becomes more important — BM25 surfaces a different *kind* of candidate (exact-keyword) that vector misses, and the reranker has to decide between heterogeneous candidates. The pipeline is set up for it.
+
+---
+
 ## ADR-017 — LLM query rewriting on multi-turn /chat (P2 closer)
 
 **Date:** 2026-05-15

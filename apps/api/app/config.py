@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # the user's question into a standalone search query before embedding.
     query_rewrite_enabled: bool = True
 
+    # Retrieval — LLM-as-judge reranker on top-N candidates → top-K. Adds one
+    # cheap LLM call (gpt-4o-mini, JSON mode, ~80 tokens out) per chat turn,
+    # but auto-skips when the top candidate clearly dominates (sim gap > 0.10).
+    rerank_enabled: bool = True
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.api_cors_origins.split(",") if o.strip()]

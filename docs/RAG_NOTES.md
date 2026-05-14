@@ -135,6 +135,39 @@ Embed *that*. The user-visible question still goes into the prompt unchanged —
 
 ---
 
+## Reranking (LLM-as-judge)
+
+**The recall vs precision split.** Vector retrieval is *recall-optimized* — pull a wide net of semantically-near candidates. But within that net, the order is by cosine similarity, computed independently for each chunk. That breaks down when two chunks are almost equally similar — the embedder has no way to know which one *actually* answers the question. Live failure: *"how old is he?"* returned `[1] sumit's age @ 0.45` and `[2] eijjuu's age @ 0.44`. The embedder couldn't see the gendered pronoun. The LLM picked `[2]` and confidently answered the wrong age.
+
+**Fix.** A *precision step* between retrieval and prompt assembly. Take the top-N candidates (max 8), send them as a numbered list with the question to gpt-4o-mini in JSON output mode, get `{"ranked": [<indices>]}` back, reorder, take top-K. The judge sees ALL candidates AND the question together — it can read both chunks and reason about which one actually matches the pronoun.
+
+**Where it runs.** [apps/api/app/services/reranker.py](apps/api/app/services/reranker.py), called from chat router after the threshold filter. Gated on `settings.rerank_enabled`. We over-fetch 2× from retrieval (so k=5 → fetch 10) so the reranker has more candidates to work with.
+
+**When it skips (and why).**
+- Fewer than 2 candidates → nothing to rerank.
+- Top similarity > 0.10 above second → clear winner, paying the LLM call would just confirm the obvious.
+- Parse failure or API error → fall back to original ordering (never break /chat).
+
+**A/B (21-case golden, graph-augmented retrieval, k_max=10, rewrite ON):**
+
+| metric    | rerank OFF | rerank ON |
+|-----------|------------|-----------|
+| recall@1  | 85.71%     | **95.24%** (+9.5pp) |
+| recall@3  | 95.24%     | **100.00%** |
+| MRR       | 0.914      | **0.976** (+0.062) |
+
+Three cases flipped to rank 1: `personal-relationship-japane` ("kenojo") was rank 5 → 1, `girlfriend-birthday` rank 2 → 1, `single-turn-pronoun-he` confirmed at rank 1 with the right tied-chunk now winning.
+
+**Why LLM-as-judge over a cross-encoder.** Cross-encoders (`bge-reranker-base`) are faster (~50ms) and free per call after the model download. But they need a Python ML dep + ~400MB model in the API container, and we don't have a measured need for the latency yet. LLM-as-judge ships in zero infra changes for ~$0.0001/turn. Easy to swap to a cross-encoder later if cost or latency demands.
+
+**Tradeoffs.**
+- +1 LLM round-trip on chat turns where rerank fires (~500-2500ms latency, ~$0.0001).
+- Skipped on clear winners — simple lookups don't pay.
+- Doubles the SQL retrieval work (over-fetch). Negligible at current scale.
+- The reranker's prompt is ~1000-1500 tokens. Costs would dominate at high volume — budget before turning on for every workspace.
+
+---
+
 ## Prompt assembly
 
 **Pattern:**

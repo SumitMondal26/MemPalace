@@ -31,6 +31,13 @@ type RewriteInfo = {
   elapsed_ms: number;
 };
 
+type RerankInfo = {
+  was_reranked: boolean;
+  skip_reason: string | null;
+  elapsed_ms: number;
+  movement: [number, number, string][];
+};
+
 type DoneInfo = {
   elapsed_ms: number;
   embed_tokens?: number;
@@ -46,6 +53,7 @@ type Message = {
   trace?: Stage[];
   prompt?: PromptInfo;
   rewrite?: RewriteInfo;
+  rerank?: RerankInfo;
   done?: DoneInfo;
 };
 
@@ -150,6 +158,10 @@ export default function ChatPanel() {
     mutateLastAssistant((m) => ({ ...m, rewrite }));
   }
 
+  function setRerank(rerank: RerankInfo) {
+    mutateLastAssistant((m) => ({ ...m, rerank }));
+  }
+
   function markDone(done: DoneInfo) {
     mutateLastAssistant((m) => ({ ...m, done }));
   }
@@ -199,6 +211,8 @@ export default function ChatPanel() {
       setPrompt(payload as PromptInfo);
     } else if (event === "rewrite" && payload && typeof payload === "object") {
       setRewrite(payload as RewriteInfo);
+    } else if (event === "rerank" && payload && typeof payload === "object") {
+      setRerank(payload as RerankInfo);
     } else if (event === "done" && payload && typeof payload === "object") {
       markDone(payload as DoneInfo);
     }
@@ -332,6 +346,23 @@ function AssistantTurn({
           title={`Rewritten in ${message.rewrite.elapsed_ms}ms · used to embed the search query, NOT to answer`}
         >
           searched as: <span className="font-mono">{message.rewrite.rewritten}</span>
+        </div>
+      )}
+
+      {message.rerank?.was_reranked && (
+        <div
+          className="rounded-md bg-amber-950/40 px-2 py-1 text-[10px] text-amber-200 ring-1 ring-amber-900/60"
+          title={`Reranked in ${message.rerank.elapsed_ms}ms · LLM-as-judge reordered the candidates by relevance`}
+        >
+          reranked {message.rerank.movement.length} candidates · {message.rerank.elapsed_ms}ms
+        </div>
+      )}
+      {message.rerank?.skip_reason && !message.rerank.was_reranked && (
+        <div
+          className="rounded-md bg-neutral-900/40 px-2 py-1 text-[10px] text-neutral-500 ring-1 ring-neutral-800"
+          title="Reranker skipped — saved an LLM call"
+        >
+          rerank skipped: {message.rerank.skip_reason}
         </div>
       )}
 

@@ -96,6 +96,12 @@
       "notes": "Pronoun-only question. Single-turn embedding has no context for 'she' — EXPECTED to fail without rewriting, EXPECTED to pass with it."
     },
     {
+      "id": "single-turn-pronoun-he",
+      "question": "how old is he ?",
+      "expected_node_titles": ["sumit's age"],
+      "notes": "Single-turn pronoun — rewriter can't help (no history). Captured live as a /chat failure where retrieval returned [1] sumit's age @ 0.45 and [2] Eijjuu's age @ 0.44 (1pp gap), and the LLM picked the wrong one. The fix lives in reranking: a precision step that re-scores top-N with both query+chunk visible at once."
+    },
+    {
       "id": "cross-doc-ai-books",
       "question": "what AI papers does sumit read?",
       "expected_node_titles": ["sumit and books", "book "],

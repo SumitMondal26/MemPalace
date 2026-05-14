@@ -10,8 +10,14 @@ SSE event types (ordered as emitted):
         Lets the UI show the rewritten search query so users see exactly
         what was sent to the embedder.
 
+    event: rerank    {was_reranked, skip_reason, elapsed_ms, movement}
+        Emitted whenever the reranker stage ran (whether it actually called
+        the LLM or skipped). `movement` is [(orig_rank, new_rank, chunk_id)]
+        so the UI can show "what got promoted" in /insights drill-down.
+
     event: sources   [{i, id, node_id, similarity, source, preview}, ...]
-        Chunks that survived the relevance threshold filter.
+        Chunks that survived the relevance threshold filter (and were
+        possibly reordered by the reranker).
 
     event: prompt    {messages, model, temperature}
         The exact array sent to OpenAI (including system + history + chunks).
@@ -42,6 +48,7 @@ from ..config import settings
 from ..deps import openai_client, supabase_user
 from ..services.llm import build_chat_messages, stream_chat_messages
 from ..services.query_rewriter import rewrite_query
+from ..services.reranker import rerank_chunks
 from ..services.retrieval import embed_query, search_chunks_with_neighbors
 
 router = APIRouter()
@@ -144,20 +151,54 @@ async def chat(
         embed_ms = int((time.perf_counter() - t_embed_start) * 1000)
 
         # === Stage 2: graph-augmented vector search ===
+        # Over-fetch (2x body.k) so the reranker has more candidates to choose
+        # from. With pure vector retrieval we'd just take the top-k; with a
+        # reranker, more candidates = more chances to promote a near-tie chunk
+        # that the embedder ranked second-best for the wrong reason.
         t_search_start = time.perf_counter()
         yield _sse(
             "stage",
             {"label": "Searching memory + 1-hop graph", "elapsed_ms": ms()},
         )
+        fetch_k = body.k * 2 if settings.rerank_enabled else body.k
         raw_chunks = await search_chunks_with_neighbors(
-            sb_user, q_vec, body.k, neighbor_count=1
+            sb_user, q_vec, fetch_k, neighbor_count=1
         )
-        chunks = [
+        # Filter by relevance threshold BEFORE rerank — don't waste judge
+        # tokens on chunks the threshold would have dropped anyway.
+        candidates = [
             c
             for c in raw_chunks
             if (c.get("similarity") or 0.0) >= RELEVANCE_THRESHOLD
         ]
         search_ms = int((time.perf_counter() - t_search_start) * 1000)
+
+        # === Stage 2.5: rerank top-N candidates → top-K (precision step) ===
+        # LLM-as-judge sees the question + all candidates together, so it can
+        # disambiguate things vector similarity cannot (pronouns, gender,
+        # near-tie chunks). Skips when too few candidates or clear winner.
+        rerank_result = None
+        if settings.rerank_enabled and candidates:
+            yield _sse(
+                "stage",
+                {"label": "Reranking candidates by relevance", "elapsed_ms": ms()},
+            )
+            rerank_result = await rerank_chunks(
+                openai, search_question, candidates, top_k=body.k
+            )
+            chunks = rerank_result.chunks
+            yield _sse(
+                "rerank",
+                {
+                    "was_reranked": rerank_result.was_reranked,
+                    "skip_reason": rerank_result.skip_reason,
+                    "elapsed_ms": rerank_result.elapsed_ms,
+                    # tuple → list for JSON
+                    "movement": [list(m) for m in rerank_result.movement],
+                },
+            )
+        else:
+            chunks = candidates[: body.k]
 
         # === Surface filtered chunks as `sources` ===
         sources = [
@@ -214,10 +255,14 @@ async def chat(
         rewrite_in = rewrite_result.prompt_tokens if rewrite_result else 0
         rewrite_out = rewrite_result.completion_tokens if rewrite_result else 0
         rewrite_cost = _cost(settings.openai_chat_model, rewrite_in, rewrite_out)
+        rerank_in = rerank_result.prompt_tokens if rerank_result else 0
+        rerank_out = rerank_result.completion_tokens if rerank_result else 0
+        rerank_cost = _cost(settings.openai_chat_model, rerank_in, rerank_out)
         cost_usd = (
             _cost(settings.openai_embedding_model, embed_tokens)
             + _cost(settings.openai_chat_model, prompt_tokens, completion_tokens)
             + rewrite_cost
+            + rerank_cost
         )
 
         # === Done event with totals ===
@@ -230,6 +275,8 @@ async def chat(
                 "completion_tokens": completion_tokens,
                 "rewrite_tokens_in": rewrite_in,
                 "rewrite_tokens_out": rewrite_out,
+                "rerank_tokens_in": rerank_in,
+                "rerank_tokens_out": rerank_out,
                 "cost_usd": round(cost_usd, 6),
             },
         )
@@ -272,6 +319,16 @@ async def chat(
                 "rewrite_tokens_in": rewrite_in,
                 "rewrite_tokens_out": rewrite_out,
                 "rewrite_cost_usd": round(rewrite_cost, 6),
+                "rerank_was_reranked": (
+                    rerank_result.was_reranked if rerank_result else None
+                ),
+                "rerank_skip_reason": (
+                    rerank_result.skip_reason if rerank_result else None
+                ),
+                "rerank_ms": rerank_result.elapsed_ms if rerank_result else None,
+                "rerank_tokens_in": rerank_in,
+                "rerank_tokens_out": rerank_out,
+                "rerank_cost_usd": round(rerank_cost, 6),
             }
             try:
                 sb_user.table("chat_logs").insert(log_row).execute()
