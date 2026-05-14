@@ -1,55 +1,127 @@
 {
-  "version": 1,
-  "description": "Mem Palace retrieval evaluation set. Each case is a question whose answer should come from at least one of the listed expected_node_titles. Add cases over time as you ingest more memory.",
+  "version": 2,
+  "description": "Mem Palace retrieval evaluation set. Each case is a question whose answer should come from at least one of the listed expected_node_titles. Mix of simple lookups, multi-node expansions, long-doc retrievals, and vague-pronoun follow-ups (the latter are the litmus test for query rewriting once it lands).",
   "k_max": 10,
   "cases": [
     {
       "id": "personal-name",
       "question": "what is my name?",
       "expected_node_titles": ["sumit"],
-      "notes": "Direct lookup; should be top-1."
+      "notes": "Simple direct lookup; should be top-1."
     },
     {
       "id": "personal-age",
       "question": "how old am I?",
       "expected_node_titles": ["sumit's age"],
-      "notes": "Direct lookup; competes with 'Eijjuu is 25 years old' which has the same template."
+      "notes": "Direct lookup; competes with 'Eijjuu is 25 years old' (template collision)."
+    },
+    {
+      "id": "personal-surname",
+      "question": "what's my surname?",
+      "expected_node_titles": ["sumit's surname "],
+      "notes": "Direct lookup; new node added later in P2 build."
     },
     {
       "id": "personal-relationship",
       "question": "who is my girlfriend?",
       "expected_node_titles": ["Eijuuu"],
-      "notes": "Direct lookup; the word 'girlfriend' appears in the chunk."
+      "notes": "Direct lookup; the word 'girlfriend' is in the chunk."
     },
     {
       "id": "personal-relationship-japanese",
       "question": "who is my kenojo?",
       "expected_node_titles": ["Eijuuu"],
-      "notes": "Same as above but with the romaji term 'kenojo'. Tests low-resource word handling."
+      "notes": "Same as above with romaji 'kenojo'. Tests low-resource word handling."
+    },
+    {
+      "id": "personal-hobby",
+      "question": "what does sumit do as a hobby?",
+      "expected_node_titles": ["sumit's hobby"],
+      "notes": "Direct lookup; should land top-1."
+    },
+    {
+      "id": "personal-gym",
+      "question": "what gym routine does sumit follow?",
+      "expected_node_titles": ["sumoo gym"],
+      "notes": "Direct lookup, chunk literally says 'Push-Pull-Legs split'."
+    },
+    {
+      "id": "ppl-explain",
+      "question": "what is push pull legs split in gym",
+      "expected_node_titles": ["sumoo gym"],
+      "notes": "The case that exposed the hallucination earlier — the chunk MENTIONS PPL but doesn't EXPLAIN it. Tests whether retrieval at least surfaces the right node, even though the model later hallucinates an explanation."
+    },
+    {
+      "id": "girlfriend-realname",
+      "question": "what is eijuuu's real name?",
+      "expected_node_titles": ["Eijuuuu"],
+      "notes": "Different node has the answer ('mitali bhuimali'). Tests cross-spelling (Eijuuuu vs Eijuuu)."
+    },
+    {
+      "id": "girlfriend-birthday",
+      "question": "when is eijuuu's birthday?",
+      "expected_node_titles": ["eijuuu's birthday"],
+      "notes": "Direct lookup."
+    },
+    {
+      "id": "girlfriend-likes",
+      "question": "what does eijuuu like to do?",
+      "expected_node_titles": ["eijuuuu likes"],
+      "notes": "Note about her hobbies (yoga, callisthenics)."
+    },
+    {
+      "id": "girlfriend-books",
+      "question": "what kinds of books does eijuuu read?",
+      "expected_node_titles": ["eijjuuu and books "],
+      "notes": "Note about fiction/thrillers preference."
+    },
+    {
+      "id": "vague-partner",
+      "question": "tell me about my partner",
+      "expected_node_titles": ["Eijuuu", "Eijuuuu", "eijuuu's birthday", "eijuuuu likes"],
+      "notes": "Vague pronoun ('partner' instead of 'girlfriend'). Multi-node expected. Litmus test for query-rewriting (P2 remaining work) — current vector likely picks Eijuuu only."
+    },
+    {
+      "id": "vague-her-age",
+      "question": "how old is she?",
+      "expected_node_titles": ["Eijjuu", "eijuuu's birthday"],
+      "notes": "Pronoun-only question. Single-turn embedding has no context for 'she'. EXPECTED to fail under current setup; query rewriting + multi-turn would resolve."
+    },
+    {
+      "id": "cross-doc-ai-books",
+      "question": "what AI papers does sumit read?",
+      "expected_node_titles": ["sumit and books", "book "],
+      "notes": "Multi-node — the personal note says he likes AI books, the doc node IS an AI paper. Best-pair-chunk should connect them; graph expansion should surface both at retrieval."
     },
     {
       "id": "paper-multi-head-attention",
       "question": "what is multi-head attention?",
-      "expected_node_titles": ["book"],
+      "expected_node_titles": ["book "],
       "notes": "Concept lookup in the Transformer paper."
     },
     {
       "id": "paper-architecture",
       "question": "what model architecture does this paper introduce?",
-      "expected_node_titles": ["book"],
+      "expected_node_titles": ["book "],
       "notes": "Should retrieve a paper chunk; abstract or model section."
     },
     {
       "id": "paper-attention-mechanism",
       "question": "how does scaled dot-product attention work?",
-      "expected_node_titles": ["book"],
-      "notes": "Specific concept that lives in a known section of the paper."
+      "expected_node_titles": ["book "],
+      "notes": "Specific concept in a known paper section."
     },
     {
       "id": "paper-positional-encoding",
       "question": "why use positional encoding in transformers?",
-      "expected_node_titles": ["book"],
-      "notes": "Tests whether retrieval finds the positional-encoding section."
+      "expected_node_titles": ["book "],
+      "notes": "Tests retrieval of the positional-encoding section."
+    },
+    {
+      "id": "paper-bleu",
+      "question": "what BLEU score did the model achieve?",
+      "expected_node_titles": ["book "],
+      "notes": "Specific number from results section. Tests fact-level retrieval."
     }
   ]
 }
