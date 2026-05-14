@@ -45,6 +45,14 @@ export default function ChatPanel() {
   async function send() {
     const q = input.trim();
     if (!q || loading) return;
+
+    // Snapshot conversation history BEFORE adding the new turn so the
+    // request body sees only completed prior turns. Drop empty placeholders
+    // (e.g. an assistant bubble still streaming would be empty here).
+    const history = messages
+      .filter((m) => m.content.trim().length > 0)
+      .map((m) => ({ role: m.role, content: m.content }));
+
     setInput("");
     setLoading(true);
 
@@ -69,7 +77,7 @@ export default function ChatPanel() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ question: q, k: 5 }),
+        body: JSON.stringify({ question: q, k: 5, history }),
       });
       if (!res.ok || !res.body) {
         const detail = await res.text().catch(() => "");

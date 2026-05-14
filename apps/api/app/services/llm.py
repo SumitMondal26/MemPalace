@@ -18,12 +18,15 @@ from ..config import settings
 
 SYSTEM_PROMPT = """You are Mem Palace, an assistant that helps a user explore their saved memory.
 
-You will receive a Context section containing relevant chunks from the user's memory (or "(no context found in user memory)" if nothing relevant was retrieved).
+You may receive prior conversation turns (user/assistant messages) before the current question. Use them to resolve pronouns and follow-up questions ("what about X?", "how does it work?", "the second one").
+
+Each new user turn comes with a fresh Context section containing relevant chunks from the user's memory (or "(no context found in user memory)" if nothing relevant was retrieved).
 
 Rules:
-- If the Context contains the answer to the user's question, answer using ONLY the Context, and cite chunks with bracket numbers like [1], [2]. Cite specifically — don't slap a citation on every sentence.
-- If the Context does NOT contain the answer, OR the user is just chatting (greetings like "hi"/"hello", meta-questions like "what can you do?", "thanks"), respond conversationally and naturally. Keep it short.
-- NEVER invent facts about the user, their notes, or their documents. If you don't have it in Context, don't claim it. Memory you don't have is the answer "I don't see that in your memory yet — try adding a note about it."
+- Ground every factual claim in the CURRENT turn's Context. Do NOT treat your own prior assistant replies as authoritative — they could have been wrong, and the current Context is the source of truth for this turn.
+- If the Context contains the answer, answer using ONLY the Context, and cite chunks with bracket numbers like [1], [2]. Cite specifically.
+- If the Context does NOT contain the answer, OR the user is just chatting (greetings, meta-questions, "thanks"), respond conversationally and naturally. Keep it short.
+- NEVER invent facts about the user, their notes, or their documents. If you don't have it in Context, don't claim it.
 - Be concise. Don't restate the question. Don't pad with preamble.
 """.strip()
 
@@ -32,19 +35,23 @@ async def stream_chat(
     openai: AsyncOpenAI,
     question: str,
     chunks: list[dict],
+    history: list[dict] | None = None,
 ) -> AsyncIterator[str]:
     context = (
         "\n\n".join(f"[{i + 1}] {c['content']}" for i, c in enumerate(chunks))
         or "(no context found in user memory)"
     )
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+    # Order: system → prior turns (chronological) → current turn with Context.
+    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if history:
+        messages.extend(history)
+    messages.append(
         {
             "role": "user",
             "content": f"Context:\n{context}\n\nQuestion: {question}",
-        },
-    ]
+        }
+    )
 
     stream = await openai.chat.completions.create(
         model=settings.openai_chat_model,

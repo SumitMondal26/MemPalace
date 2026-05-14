@@ -80,6 +80,28 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-014 — Multi-turn chat: client sends history, server caps it
+
+**Date:** 2026-05-14
+
+**Context.** Each chat turn was previously independent. Users couldn't ask follow-ups like *"what about her age?"* or *"how does it work?"* because the model had no prior context — every turn started cold. Real chat UX needs at minimum a few turns of memory.
+
+**Decision.** The browser maintains the full conversation in component state (already does — `messages`). On each new question, it snapshots the prior turns (filter empty placeholders), sends them as a `history` field on the `/chat` request body. The API caps the history to the last 6 messages (`HISTORY_MAX_MESSAGES`) at the boundary so a runaway client can't blow the context window. The LLM service appends them to the messages array between the system prompt and the current user turn.
+
+The system prompt was updated to explain history handling: prior assistant replies are NOT authoritative for the current turn — only the fresh Context is. This prevents the model from drifting into "I said X earlier so I should keep saying X" when current retrieval contradicts a prior claim.
+
+**Consequence.**
+- Pro: Natural follow-ups work — pronouns, "what about", "the second one", etc.
+- Pro: Conversation memory is local-only (lives in component state, dies on reload). No server storage, no sync. Simplest possible.
+- Pro: Hard cap at the API prevents pathological usage.
+- Con: History resets on page reload. P3+ would persist conversations to DB if users want persistent threads.
+- Con: Retrieval still fires on the literal current question only. A query like "how many heads?" might miss the right chunks because vector similarity to the bare phrase is weak. P3 upgrade: rewrite the query using prior context before embedding ("how many heads does multi-head attention use?" rewritten from "how many heads?" + prior turn about MHA).
+- Con: Cost grows per turn (~each turn re-sends prior content). Capped at 6 messages keeps it bounded.
+
+**Path:** P3 adds query rewriting (LLM call before retrieval) when conversation context is non-trivial. P3+ persists conversations if multi-device or share-thread is needed.
+
+---
+
 ## ADR-013 — Auto-connect v2: best-pair-chunk + kNN per node
 
 **Date:** 2026-05-14

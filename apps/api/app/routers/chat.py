@@ -24,7 +24,7 @@ reflection) — the UI's trace component just renders more rows.
 
 import json
 import time
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -47,9 +47,20 @@ router = APIRouter()
 RELEVANCE_THRESHOLD = 0.4
 
 
+class ChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+# Cap on how many prior turns the client can include. Hard limit at the API
+# boundary so a runaway client can't blow the context window or our bill.
+HISTORY_MAX_MESSAGES = 6
+
+
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1)
     k: int = Field(5, ge=1, le=20)
+    history: list[ChatHistoryMessage] = Field(default_factory=list)
 
 
 def _sse(event: str, data: object) -> str:
@@ -122,7 +133,15 @@ async def chat(
             stage_label = "Memory is empty — replying conversationally"
         yield _sse("stage", {"label": stage_label, "elapsed_ms": ms()})
 
-        async for token in stream_chat(openai, body.question, chunks):
+        # Cap the history at HISTORY_MAX_MESSAGES from the tail (most recent).
+        history = [
+            {"role": m.role, "content": m.content}
+            for m in body.history[-HISTORY_MAX_MESSAGES:]
+        ]
+
+        async for token in stream_chat(
+            openai, body.question, chunks, history=history
+        ):
             yield _sse("token", token)
 
         yield _sse("done", {"elapsed_ms": ms()})
