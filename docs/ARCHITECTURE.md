@@ -96,12 +96,13 @@ User edits content → Save in Sidebar
                    → Sidebar shows "✓ N chunks indexed"
 ```
 
-## Data flow: chat (graph-augmented RAG)
+## Data flow: chat (graph-augmented RAG, multi-turn, observed)
 
 ```
-User question
+User question + prior 6 messages (history snapshot)
    → POST /chat (SSE response)
-   → embed_query (OpenAI text-embedding-3-small)
+   → resolve workspace_id via supabase_user
+   → embed_query (OpenAI text-embedding-3-small)  → embed tokens captured
    → match_chunks_with_neighbors RPC:
        - top-k vector search (CTE: seed)
        - find seed nodes' 1-hop neighbors via edges (manual + semantic, undirected)
@@ -109,12 +110,21 @@ User question
        - union seed + neighbor chunks, source-labeled, ordered seeds-first
    → filter chunks where similarity < 0.4 (RELEVANCE_THRESHOLD)
    → emit SSE event: sources [{i, id, node_id, similarity, source, preview}]
-   → build prompt: system + numbered chunks + question
-   → llm.stream_chat (OpenAI, stream=True)
+   → build prompt = system + history (capped 6) + current user-with-Context
+   → emit SSE event: prompt {messages, model, temperature}    ← debug surface
+   → llm.stream_chat_messages (stream_options.include_usage=true)
      → for each token, emit SSE event: token "..."
-   → emit SSE event: done {elapsed_ms}
-   → ChatPanel reads frames, dispatches: trace rows (stage), chips (sources),
-     bubble content (token), total time (done)
+     → final event carries OpenAI usage (prompt_tokens, completion_tokens)
+   → compute cost from per-model price table
+   → emit SSE event: done {elapsed_ms, embed_tokens, prompt_tokens,
+                            completion_tokens, cost_usd}
+   → INSERT row into chat_logs (try/except — never blocks user response)
+   → ChatPanel reads frames, dispatches:
+       - trace rows (stage)
+       - chips with click-to-expand previews (sources)
+       - bubble content (token)
+       - "view raw prompt" expandable panel (prompt)
+       - total time + token + cost line (done)
 ```
 
 ## Data flow: semantic edges (auto-connect)
@@ -134,6 +144,49 @@ Click "✨ Auto-connect" in canvas
    → return count of new edges
    → frontend refetches edges, updates Zustand store
    → 3D canvas renders with animated purple particles on semantic edges
+```
+
+## Data flow: unified add-memory + auto-connect chain
+
+```
+Click "+ Add memory ▸" → dropdown → pick type
+   → store.startDraft(type)  (clears any selection, sets draftType)
+   → Sidebar slides in with type-aware DraftForm
+       - note: title + content
+       - url:  title + URL + optional notes
+       - doc:  title only (file upload after creation)
+   → user fills + clicks Save
+   → db.createNode(...) → row in `nodes`
+   → store.upsertNode + selectNode (which clears draftType)
+   → Sidebar transitions to edit-mode for new node
+   → If type ∈ {note, url} AND content non-empty:
+       - POST /nodes/{id}/embed
+           → DELETE existing chunks for node
+           → chunk + batch-embed via OpenAI
+           → INSERT new chunks
+       - POST /workspaces/{id}/rebuild-edges
+           → SQL function: best-pair-chunk + kNN (K=3) + min-weight (0.25)
+           → DELETE old kind='semantic' edges, INSERT fresh ones
+       - db.listEdges(workspace_id) → store.setEdges
+       - 3D canvas re-renders with new node + new edges + animated particles
+   → If type = doc: user uploads file → /ingest → same chain triggered by
+     UploadDropzone.onProcessed callback
+```
+
+## Data flow: AI observability (/insights)
+
+```
+[every chat turn writes one chat_logs row]
+   ↓
+/insights (server component)
+   → supabaseServer().from("chat_logs").select("*").limit(100)  (RLS-scoped)
+   → InsightsClient (client component)
+       - 4 aggregate cards: Requests, Total cost, Avg latency (p95),
+         Empty-context rate
+       - Stage-timing breakdown bar (cyan embed / emerald search / amber llm)
+       - Recent-requests list (left): cost/latency/tokens per row
+       - Drill-down panel (right): every captured field for selected row,
+         including the raw prompt with role-tagged messages
 ```
 
 ## Eval pipeline
@@ -169,6 +222,9 @@ These should never break. If you change code that touches one, update this doc.
 6. **Every retrieval change is measured.** Run `make evals` before + after; record numbers in commit message.
 7. **The graph is operational, not decorative.** `match_chunks_with_neighbors` is the default; semantic edges feed retrieval, not just rendering.
 8. **JWT verification supports both HS256 and JWKS.** Don't downgrade — Supabase rotates and we shouldn't break.
+9. **Every chat turn produces a chat_logs row.** Logging wrapped in try/except so it can never block the user response, but this is the substrate for /insights and any future observability work.
+10. **The auto-connect chain runs after every memory mutation.** Save a note → embed → rebuild-edges → refresh store. No "remember to click Auto-connect."
+11. **Conversation memory is local-only** (lives in ChatPanel's component state). No DB persistence. Capped at 6 messages at the API boundary.
 
 ## Open architectural questions (deferred)
 

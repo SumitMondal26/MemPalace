@@ -11,9 +11,14 @@ A visual AI memory system. Your knowledge as an interconnected graph of nodes �
 - **Notes + docs + URLs** — create, edit, delete nodes; manual edges by drag (when re-enabled in P2); content auto-embeds on save so every memory is searchable.
 - **PDF / text upload pipeline** — Supabase Storage → FastAPI extracts text → tiktoken-aware chunking → batched OpenAI embeddings → pgvector.
 - **Chat with your memory** — POST /chat streams over SSE with a live trace (stage/sources/token/done events). Relevance threshold + relaxed grounding mean it answers "hello" conversationally and "what is multi-head attention?" with grounded citations.
-- **Auto-connect (semantic edges)** — "✨ Auto-connect" button computes pairwise cosine over node-mean embeddings via a single SQL function and inserts edges. Threshold-tunable. Animated purple particles flow along semantic edges in the 3D canvas.
-- **Graph-augmented retrieval** — `/chat` now uses `match_chunks_with_neighbors`: vector top-k + 1-hop graph expansion in one DB round-trip. Measured: at stress test, recall@5 lifts 75% → 100%.
+- **Multi-turn conversation memory** — last 6 messages of each chat session sent as history; pronouns and follow-ups ("what about her age?") resolve naturally.
+- **Auto-connect v2.1** — single SQL function does best-pair-chunk similarity (max over chunk-pair Cartesian) + kNN per node (top-3) + min-weight floor (0.25). No threshold tuning, no orphan nodes, no false-friend noise. Chain runs automatically after every save.
+- **Graph-augmented retrieval** — `/chat` uses `match_chunks_with_neighbors`: vector top-k + 1-hop graph expansion in one DB round-trip. Measured: at stress test, recall@5 lifts 75% → 100%.
+- **Edge weight visualization** — discrete color tiers (slate/cyan/amber by similarity), legend in canvas corner, edge width + particle density modulated by weight. Force simulation tuned for spaced layout.
+- **Unified add-memory flow** — single "+ Add memory ▸" button → dropdown → type-aware draft form rendered inside the sidebar. Save chains: persist → embed → auto-connect → refresh edges. Zero manual clicks.
 - **Eval harness** — `make evals` runs a JSON golden set against the production retrieval path, reports recall@1/3/5/10 + MRR, supports A/B comparison via `EVAL_STRATEGY` env var.
+- **AI observability dashboard** — `/insights` page shows aggregate cost/latency/empty-context-rate, per-stage timing breakdown, recent-request list with drill-down to the raw prompt sent to OpenAI for any chat turn. Powered by a `chat_logs` table that records every turn (RLS-scoped per workspace).
+- **In-chat raw-prompt panel** — every assistant message has a "▶ view raw prompt" expander showing the exact messages array sent to the LLM. Token counts + $ cost rendered inline.
 
 ## Stack
 
@@ -89,11 +94,13 @@ EVAL_K_MAX=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals  # stress test
 ## Project layout
 
 ```
-apps/web/      Next.js app (UI, auth cookies, 3D canvas, chat panel)
-apps/api/      FastAPI app (ingest, chat, semantic edges, /me)
+apps/web/      Next.js app (UI, auth cookies, 3D canvas, chat panel, /insights)
+apps/api/      FastAPI app (ingest, chat, semantic edges, /me, observability writes)
 apps/api/eval/ Eval harness (golden.json + run_evals.py)
-supabase/      SQL migrations (init, storage, semantic edges, graph-aug)
-docs/          Architecture, decisions, roadmap, RAG notes, evals docs, study guide, progress log
+supabase/      SQL migrations (init, storage, semantic-v1, graph-aug, semantic-v2,
+               min-weight floor, chat_logs)
+docs/          Architecture, decisions, roadmap, RAG notes, evals docs,
+               study guide, progress log
 ```
 
 ## Verifying it works

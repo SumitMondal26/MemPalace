@@ -149,6 +149,55 @@ This is **not** a changelog (those are version-anchored). This is a **learning l
 
 ---
 
+## 2026-05-14 — `df4a078` — auto-connect v2.1: min-weight floor + weight-modulated edge viz
+
+**Shipped:**
+- Migration 0006: adds `min_weight` parameter (default 0.25) on `rebuild_semantic_edges`. Drops edges below the floor AFTER kNN selection.
+- Frontend: edge `weight` is now in the `GLink` type. Edge width, opacity, and particle count modulate with weight.
+- Particle color matches edge color (smooth gradient at this point, switched to discrete tiers in next commit).
+- ADR-013 updated to capture the v2.1 refinement.
+
+**What I learned:**
+- **kNN guarantees connectivity but not quality.** Without a floor, every node gets K partners regardless of how weak. The floor is the absolute-minimum check that complements relative ranking.
+- **Edge weight at the data layer + visualization at the view layer.** Don't filter weak edges out of the data — keep them and let the renderer fade them. Same idea as low-confidence search results in a different section.
+- **The "false friends" problem returned at the floor level.** Looking at our edges: the `Eijuuu↔book` at 0.151 (forced by kNN) was matching on "people doing things together" surface pattern, not topic. The floor caught it cleanly.
+
+---
+
+## 2026-05-14 — `039be91` — discrete edge color tiers + legend + spaced-out force layout
+
+**Shipped:**
+- Tried gradient color (HSL purple shades) first — produced muddy mids hard to compare.
+- Switched to **3 discrete color tiers**: slate (weak, < 0.40), cyan (medium, 0.40-0.50), amber (strong, ≥ 0.50). Distinct hues, easy to read at a glance.
+- Edge tiers + color helper extracted to `apps/web/lib/edgeTiers.ts` so the legend in `GraphPageClient` reads from the same source as the canvas renderer.
+- Legend appears in the top-right canvas controls under Auto-connect.
+- Force-simulation tuning: bumped `linkForce.distance` to 80 and `chargeForce.strength` to -150. Edges now have visible length, nodes don't pile up.
+
+**What I learned:**
+- **Continuous gradients sound nice but distinct tiers read better.** Three colors mapping to three confidence buckets gave instant comprehension; HSL interpolation gave purple-purple-purple that all looked the same.
+- **Single source of truth across UI components matters.** Putting `EDGE_TIERS` in a shared lib file means the legend swatches and the actual edge colors can never drift — change the constant, both update.
+- **Next.js can be picky about non-component named exports from `"use client"` files.** First attempted to export the constant from GraphCanvas itself; got an "import not found" error. Moving to a plain `lib/` file fixed it. Worth knowing the boundary's quirks.
+- **d3-force defaults are too cramped for our zoom level.** Defaults assume hundreds of nodes; we have a handful. Tuning is one-line per knob.
+
+---
+
+## 2026-05-14 — `cf41ec8` — multi-turn chat: client sends history, server caps to 6 messages
+
+**Shipped:**
+- `ChatRequest.history: list[ChatHistoryMessage]` field.
+- API caps history at `HISTORY_MAX_MESSAGES = 6` (most-recent tail) at the boundary.
+- `llm.stream_chat` accepts optional `history` param, splices prior turns between system prompt and current user-with-Context turn.
+- `SYSTEM_PROMPT` updated: "prior assistant replies are NOT authoritative for current turn — only fresh Context is." Anti-drift insurance.
+- ChatPanel snapshots messages BEFORE adding the new user/assistant pair, sends them as `history` in the request body.
+- ADR-014 captures design + known weakness (retrieval still embeds the literal current question — vague follow-ups remain weak; query rewriting is the bridge to be built later).
+
+**What I learned:**
+- **History and RAG are complementary memory layers, not replacements.** Long-term = the graph + retrieval; short-term = conversation history; both stack into the same prompt. Each turn re-runs full retrieval on the current question.
+- **The natural follow-up "how many heads?" exposes the limit.** Vector search of "how many heads?" alone is a weak signal. History helps the LLM understand the question, but retrieval doesn't see history. The fix is query rewriting (one LLM call to rewrite the vague question using prior context BEFORE embedding) — a P3-ish upgrade.
+- **A hard cap at the API boundary protects you from runaway clients.** Without `HISTORY_MAX_MESSAGES = 6`, a buggy or malicious client could send 1000 prior messages and blow your context window + bill.
+
+---
+
 ## 2026-05-15 — AI observability: prompt visibility + /insights page
 
 **Shipped:**
@@ -173,6 +222,40 @@ This is **not** a changelog (those are version-anchored). This is a **learning l
   - Prompt: ~500-2000 tokens × $0.15/1M = ~$0.00007-0.0003
   - Completion: ~50-200 tokens × $0.60/1M = ~$0.00003-0.00012
   - **Total: ~$0.0001-0.0004 per chat turn** ≈ 1000-5000 turns per dollar.
+
+---
+
+## 2026-05-15 — `f34bd76` — unified add-memory flow
+
+**Shipped:**
+- Three "+ note / + doc / + url" header buttons replaced by one "+ Add memory ▸" with a dropdown of three types.
+- Modal-based create flow scrapped. Instead, a type-aware DRAFT form renders *inside the sidebar* (slides in from right, same as edit mode).
+- Note draft: title + content. URL draft: title + URL field + optional notes. Doc draft: title only; transitions to upload area after create.
+- New `draftType: NodeType | null` slice in the Zustand store with `startDraft` / `cancelDraft`. Mutually exclusive with `selectedNodeId`.
+- After creating a note/url with content, automatically chains: persist → embed → auto-connect → refetch edges. Zero manual clicks.
+- `CreateNodeModal.tsx` deleted (no longer used).
+
+**What I learned:**
+- **Prefer one strong UI slot to many specialized ones.** Three buttons + a modal layer = visual noise + extra clicks. One button + dropdown + the existing sidebar slot = same functionality, less surface, more cohesive.
+- **Mutually exclusive store slices model UX correctly.** "Drafting a new node" and "editing an existing node" are conceptually opposite — the user can't do both at once. Making `selectNode` clear `draftType` (and vice-versa) at the action level prevents the impossible "drafting AND editing" state from ever existing.
+- **Auto-chained side effects feel magical when they're correct.** "Save → embed → auto-connect → refresh" all firing automatically after a single Save click is the difference between "this app is built well" and "I keep forgetting to click Auto-connect." The chain has to be reliable, though — wrap each step in try/catch so a partial failure doesn't break the next.
+
+---
+
+## 2026-05-15 — docs housekeeping pass #2
+
+**Shipped:**
+- ROADMAP updated to reflect P2 ~70% shipped, with the things-we-shipped-that-weren't-on-roadmap (observability, UI polish, unified add-flow) as their own group.
+- 4 missing PROGRESS entries added (this entry, plus v2.1 / color tiers / multi-turn / unified add-flow / observability).
+- ARCHITECTURE updated: multi-turn chat flow, observability flow, /insights mention, updated system diagram.
+- README updated with new capabilities in "What works today" + new commands.
+- LEARNING gets a new Part 3 covering today's concepts (multi-turn memory, AI observability, best-pair-chunk + kNN, min-weight floor, weight visualization, unified add-memory pattern).
+- ADR-016 added for the unified add-memory flow design.
+
+**What I learned:**
+- **Docs drift faster than code, and the gap compounds.** The previous housekeeping pass at `adfea8b` covered ~half the project's history; only 4 commits later docs were stale again. The fix isn't docs-after-everything-ships but **a small entry per commit** — habit, not heroic effort.
+- **Different docs serve different audiences AND different time horizons.** README = next-time-you-show-this; PROGRESS = next-time-you-debug-or-interview-prep; ROADMAP = next-time-you-decide-what-to-build; LEARNING = next-time-you-need-to-explain-it. The cost of any one being stale isn't the same.
+- **Building observability (chat_logs + /insights) was originally P4 work.** I pulled it forward because the gym-question hallucination needed visibility to debug. Lesson: roadmaps are guides, not contracts. When a missing capability blocks understanding, build it now.
 
 ---
 

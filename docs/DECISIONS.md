@@ -80,6 +80,34 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-016 — Unified add-memory flow: one button + dropdown + sidebar draft
+
+**Date:** 2026-05-15
+
+**Context.** Original P1 surfaced three distinct buttons in the header: `+ note`, `+ doc`, `+ url`. Each instantly created an empty node and opened the sidebar so the user could fill in title + content. UX problems with this:
+- Three buttons crowded the header next to Sign out + Insights link.
+- "Empty node now exists in DB; user might walk away leaving cruft."
+- For URL, no dedicated URL field — user had to remember to paste a URL into the content textarea.
+- After Save, user had to manually click "✨ Auto-connect" to wire the new node into the graph. Easy to forget.
+
+A first iteration (commit `7e598b0` era) tried a modal for type-specific creation. That added a third visual layer (canvas + sidebar + modal) — too much.
+
+**Decision.** Single "+ Add memory ▸" button with a dropdown of three types. Picking a type doesn't create a node; instead it sets `draftType` in the Zustand store, which causes the sidebar to render a type-aware DraftForm in the same slot it normally uses for editing. Submit creates the node, transitions the sidebar to edit-mode, then chains: embed → auto-connect → refresh edges, all in the background.
+
+The store state has `selectedNodeId` and `draftType` as mutually exclusive (selecting clears the draft, drafting clears the selection). Sidebar visibility (slide-in transform) keys on `selectedNodeId || draftType`.
+
+**Consequence.**
+- Pro: One button instead of three. Header less cluttered.
+- Pro: No empty nodes in DB if the user backs out — node only exists after Save.
+- Pro: URL gets a dedicated input field; doc shows a hint about file upload coming after creation.
+- Pro: Auto-connect chain means new memories are immediately wired into the graph without an extra click.
+- Pro: No modal layer — uses the same sidebar slot the user already learned for editing.
+- Pro: Mutually-exclusive store slices model the UX correctly (you can't draft AND edit simultaneously).
+- Con: Form fields lose state if user picks a different type mid-draft (acceptable — uncommon flow).
+- Con: A failure in the auto-connect chain is silent (logged to console, not surfaced to user). Pre-P3, acceptable; with agents we'd want UI feedback.
+
+---
+
 ## ADR-015 — AI observability: chat_logs table + /insights page
 
 **Date:** 2026-05-15

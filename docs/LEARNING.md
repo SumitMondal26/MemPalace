@@ -203,7 +203,105 @@ You did this exact loop in one session. Internalize the shape.
 
 ---
 
-# Part 3 — Architecture & flows (still current)
+# Part 3 — P2.5 Concepts (added 2026-05-15)
+
+What we built in the second wave of P2 work. Each one teaches a different RAG-engineering muscle.
+
+## 3.1 Best-pair-chunk for cross-node similarity
+
+**What.** When scoring "how similar is node A to node B?", instead of comparing `mean(A.chunks)` to `mean(B.chunks)`, take the **MAX** over all chunk-pair Cartesians:
+
+```
+similarity(A, B) = MAX over (chunk_a in A, chunk_b in B) of cosine(chunk_a, chunk_b)
+```
+
+**Why.** Mean-of-chunks dilutes a long doc into a generic-topic vector. A 23-chunk paper's mean lives in "AI paper space" and matches nothing specifically. Best-pair-chunk: as long as ONE chunk of A matches some chunk of B strongly, the connection forms.
+
+**Where.** `supabase/migrations/0005_rebuild_semantic_edges_v2.sql` — the `pair_max` CTE.
+
+**Soundbite.** *"Best-pair-chunk is to mean-of-chunks what max-pooling is to average-pooling. For long docs, the average is a smear; the max is the actual best evidence of relatedness."*
+
+## 3.2 kNN per node (relative ranking)
+
+**What.** For each node, take its **top-K most-similar partners** as edges. K=3 default. No global threshold.
+
+**Why.** A single global threshold can't serve all node-pair categories — short notes peak at 0.6, long-doc-mean pairs peak at 0.4, related entities in different sentence templates peak at 0.4. kNN per node adapts naturally — every node gets ~K of its nearest, regardless of absolute scale.
+
+**Where.** Same SQL function (0005), the `bidirectional` + `ranked` + `selected` CTE chain.
+
+**Soundbite.** *"Threshold tuning is symptom; the disease is using a single absolute knob over heterogeneous data. kNN replaces the absolute knob with relative ranking — each node is its own context."*
+
+## 3.3 Min-weight floor (kNN's safety net)
+
+**What.** After kNN selects top-K partners per node, drop any edge with similarity below an absolute floor (0.25 default).
+
+**Why.** kNN guarantees connectivity but not quality. A node with 4 weak partners and no strong ones will have its top-3 forced through anyway — those edges are usually "people doing things together"-style surface-form noise. The floor catches them.
+
+**Where.** Migration 0006, the `selected` CTE's `where rn <= k_neighbors and similarity >= min_weight`.
+
+**Soundbite.** *"kNN is for connectivity; the floor is for quality. Both layers needed, neither sufficient alone."*
+
+## 3.4 Multi-turn conversation memory
+
+**What.** Each `/chat` request includes the prior 6 messages as a `history` array. The server splices them between the system prompt and the current user-with-Context turn before calling the LLM.
+
+**Why.** Without history, every chat turn is a cold start — the model can't resolve "her age," "what about it?", "the second one". With history, follow-ups work like real conversation.
+
+**Where.** `apps/api/app/routers/chat.py::ChatRequest` + `apps/api/app/services/llm.py::stream_chat_messages` + `apps/web/components/ChatPanel.tsx::send`.
+
+**The known weakness.** Retrieval still fires on the *literal current question*. "How many heads?" alone has weak embedding signal — vector might miss the right chunk even though the model would understand the question via history. Fix: **query rewriting** (one LLM call uses prior turns to rewrite the question into a self-contained search query before embedding). Documented as P3 work in ADR-014.
+
+**Soundbite.** *"Multi-turn layers conversation memory on top of RAG, doesn't replace it. Each turn re-runs full retrieval on the current question; the model uses history to resolve pronouns. The bridge between them — query rewriting — is the natural next layer."*
+
+## 3.5 AI observability (chat_logs + /insights)
+
+**What.** Every chat turn writes one row to a `chat_logs` table capturing: question, answer, full prompt array, cited node IDs, model meta, retrieval stats, per-stage timings (embed/search/llm), token counts (via `stream_options.include_usage`), computed $ cost, and status. A `/insights` page renders aggregate cards + per-row drill-down with the raw prompt visible.
+
+**Why.** Without observability, every retrieval bug is anecdote. With it, every bug is reproducible. We caught a hallucination (the gym-question answer with no `[N]` citations) by reading the raw prompt in /insights — that's the loop a real AI engineer runs daily.
+
+**Where.** Migration 0007 creates the table; `apps/api/app/routers/chat.py` writes each row at end of stream; `apps/web/app/insights/` renders the dashboard.
+
+**Soundbite.** *"Observability isn't optional in production AI. Building it in-house first means I understand what Langfuse/Phoenix actually store; migration to OpenTelemetry later is straightforward — every chat_logs row maps to an OTel span. Until then, I own the data, the schema, and the queries."*
+
+## 3.6 Cost + token accounting
+
+**What.** OpenAI's chat-completion streaming returns token usage in the final event when you set `stream_options={"include_usage": true}`. Embeddings return usage on the response object directly. We capture both, then compute $ cost via a per-model price table.
+
+**Why.** Most teams either drastically over- or under-estimate LLM costs. Tracking from day one builds intuition. Surprise bills happen to teams who didn't.
+
+**Real numbers from our data.** ~$0.0001 to $0.0004 per chat turn at gpt-4o-mini + text-embedding-3-small ≈ 1000-5000 turns per dollar. Embedding cost is essentially free; LLM input + output tokens dominate.
+
+**Where.** `PRICE_PER_TOKEN` map at the top of `apps/api/app/routers/chat.py`.
+
+**Soundbite.** *"I track every token and every cent from chat turn one. text-embedding-3-small is essentially free; gpt-4o-mini is cheap; cost discipline is just tracking + a price table that ages with OpenAI's docs. Real LLM bills come from accidentally retrying expensive calls in loops, not from per-request pricing."*
+
+## 3.7 Weight-modulated visualization (data layer + view layer separation)
+
+**What.** Edges in the canvas have continuous weights (cosine similarity) but render in **discrete tiers**: slate (weak), cyan (medium), amber (strong). Width + particle density also modulate with weight. Legend in canvas corner shows the tier boundaries.
+
+**Why.** First attempt: continuous HSL gradient. Result: muddy purples in the middle range that were hard to compare. Three discrete hues read instantly. **Lesson: gradient looks smarter on paper; discrete tiers are easier on actual eyes.**
+
+**Architectural consequence.** The data layer keeps full-precision weight (we don't filter weak edges out — kept and rendered faded). The view layer chooses how to bin and color. This separation is the right pattern: never lose information at storage; render appropriately at display.
+
+**Where.** Tier definitions live in `apps/web/lib/edgeTiers.ts` so both the canvas and the legend read from the same source of truth.
+
+**Soundbite.** *"Data layer keeps everything; view layer filters by importance. Same idea as showing high-confidence search results prominently and low-confidence ones in a 'less relevant' section. I don't drop weak edges — I render them faintly and let the eye do the filtering."*
+
+## 3.8 Unified add-memory flow (UX architectural lesson)
+
+**What.** Three buttons + a modal collapsed into one button + dropdown + sidebar draft form. The sidebar slot does double duty: type-aware draft form when in draft mode, edit form when a node is selected. Mutually exclusive at the store-state level.
+
+**Why.** Three buttons crowded the header; modals add a third visual layer. One slot doing double duty = simpler mental model.
+
+**Architectural consequence.** When state slices are *conceptually* mutually exclusive (drafting vs editing), encode that in the store: `selectNode` clears `draftType`, `startDraft` clears `selectedNodeId`. Impossible states become *unrepresentable*, not just *unhandled*.
+
+**Where.** `apps/web/lib/store.ts` (the `draftType` slice + actions); `apps/web/components/Sidebar.tsx` (render branching).
+
+**Soundbite.** *"Mutually-exclusive UX states should be mutually-exclusive store state. If a user can't logically be in two states at once, my code shouldn't even allow representing both. Cleaner than every component checking 'am I drafting OR editing?' at runtime."*
+
+---
+
+# Part 4 — Architecture & flows (still current)
 
 ## 3.1 Why two services
 
