@@ -46,6 +46,29 @@ type DoneInfo = {
   cost_usd?: number;
 };
 
+/** One agent step: either a tool call or its result. The trace UI renders
+ *  them as a collapsible row each; pairing a `tool_call` with its
+ *  `tool_result` happens via tool_call_id. */
+type AgentStep =
+  | {
+      kind: "tool_call";
+      iter: number;
+      name: string;
+      args: Record<string, unknown>;
+      tool_call_id: string;
+      elapsed_ms: number;
+    }
+  | {
+      kind: "tool_result";
+      iter: number;
+      name: string;
+      tool_call_id: string;
+      ok: boolean;
+      result_preview: string;
+      tool_ms: number;
+      elapsed_ms: number;
+    };
+
 type Message = {
   role: "user" | "assistant";
   content: string;
@@ -55,6 +78,11 @@ type Message = {
   rewrite?: RewriteInfo;
   rerank?: RerankInfo;
   done?: DoneInfo;
+  /** Set when this turn used the agent path. The trace UI renders agentSteps
+   *  inline with stages so the user sees tool calls in time order. */
+  agentSteps?: AgentStep[];
+  agentIterations?: number;
+  agentHitIterCap?: boolean;
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -64,6 +92,9 @@ export default function ChatPanel() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  // Agent mode toggle. /chat = single-pass RAG (cheaper, faster).
+  // /agent = multi-step LLM-tools loop (richer reasoning, ~3× cost & latency).
+  const [agentMode, setAgentMode] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -102,13 +133,17 @@ export default function ChatPanel() {
     }
 
     try {
-      const res = await fetch(`${API_BASE}/chat`, {
+      const endpoint = agentMode ? "/agent" : "/chat";
+      const body = agentMode
+        ? { question: q, history }
+        : { question: q, k: 5, history };
+      const res = await fetch(`${API_BASE}${endpoint}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ question: q, k: 5, history }),
+        body: JSON.stringify(body),
       });
       if (!res.ok || !res.body) {
         const detail = await res.text().catch(() => "");
@@ -162,6 +197,21 @@ export default function ChatPanel() {
     mutateLastAssistant((m) => ({ ...m, rerank }));
   }
 
+  function pushAgentStep(step: AgentStep) {
+    mutateLastAssistant((m) => ({
+      ...m,
+      agentSteps: [...(m.agentSteps ?? []), step],
+    }));
+  }
+
+  function setAgentMeta(iters: number, hitCap: boolean) {
+    mutateLastAssistant((m) => ({
+      ...m,
+      agentIterations: iters,
+      agentHitIterCap: hitCap,
+    }));
+  }
+
   function markDone(done: DoneInfo) {
     mutateLastAssistant((m) => ({ ...m, done }));
   }
@@ -213,8 +263,21 @@ export default function ChatPanel() {
       setRewrite(payload as RewriteInfo);
     } else if (event === "rerank" && payload && typeof payload === "object") {
       setRerank(payload as RerankInfo);
+    } else if (event === "tool_call" && payload && typeof payload === "object") {
+      pushAgentStep({ kind: "tool_call", ...(payload as Omit<Extract<AgentStep, { kind: "tool_call" }>, "kind">) });
+    } else if (event === "tool_result" && payload && typeof payload === "object") {
+      pushAgentStep({ kind: "tool_result", ...(payload as Omit<Extract<AgentStep, { kind: "tool_result" }>, "kind">) });
+    } else if (event === "final" && payload && typeof payload === "object") {
+      // Agent path delivers the final answer as one event (no token stream).
+      const p = payload as { content: string; iter_used: number };
+      mutateLastAssistant((m) => ({ ...m, content: p.content }));
+      setAgentMeta(p.iter_used, false);
     } else if (event === "done" && payload && typeof payload === "object") {
-      markDone(payload as DoneInfo);
+      const p = payload as DoneInfo & { iterations?: number; hit_iter_cap?: boolean };
+      markDone(p);
+      if (typeof p.iterations === "number") {
+        setAgentMeta(p.iterations, !!p.hit_iter_cap);
+      }
     }
   }
 
@@ -285,15 +348,38 @@ export default function ChatPanel() {
           e.preventDefault();
           send();
         }}
-        className="border-t border-palace-edge p-3"
+        className="space-y-2 border-t border-palace-edge p-3"
       >
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
           disabled={loading}
-          placeholder="What's in your memory?"
+          placeholder={
+            agentMode
+              ? "Ask anything — agent will search & reason in steps"
+              : "What's in your memory?"
+          }
           className="w-full rounded-lg bg-palace-bg px-3 py-2 text-sm outline-none ring-1 ring-palace-edge focus:ring-palace-accent disabled:opacity-50"
         />
+        <div className="flex items-center justify-between text-[10px] text-neutral-500">
+          <label className="flex cursor-pointer items-center gap-1.5 select-none">
+            <input
+              type="checkbox"
+              checked={agentMode}
+              onChange={(e) => setAgentMode(e.target.checked)}
+              disabled={loading}
+              className="accent-palace-accent"
+            />
+            <span className={agentMode ? "text-palace-accent" : ""}>
+              🤖 Agent mode
+            </span>
+          </label>
+          <span className="text-neutral-600">
+            {agentMode
+              ? "multi-step · search + read tools · ~3× cost"
+              : "single-pass RAG"}
+          </span>
+        </div>
       </form>
     </div>
   );
@@ -338,6 +424,27 @@ function AssistantTurn({
           doneMs={message.done?.elapsed_ms ?? null}
           isLive={isStreaming && !isDone}
         />
+      )}
+
+      {message.agentSteps && message.agentSteps.length > 0 && (
+        <AgentTrace steps={message.agentSteps} />
+      )}
+
+      {message.agentIterations != null && (
+        <div
+          className={`rounded-md px-2 py-1 text-[10px] ${
+            message.agentHitIterCap
+              ? "bg-amber-950/40 text-amber-200 ring-1 ring-amber-900/60"
+              : "bg-violet-950/40 text-violet-200 ring-1 ring-violet-900/60"
+          }`}
+          title="Number of LLM-tools loop iterations the agent used"
+        >
+          {message.agentHitIterCap
+            ? `agent hit iteration cap (${message.agentIterations})`
+            : `agent · ${message.agentIterations} iteration${
+                message.agentIterations === 1 ? "" : "s"
+              }`}
+        </div>
       )}
 
       {message.rewrite?.was_rewritten && (
@@ -540,4 +647,74 @@ function Trace({
       </ol>
     </div>
   );
+}
+
+/**
+ * AgentTrace — renders the LLM-tools loop as a vertical list. Each row is
+ * either a tool_call (collapsed args) or its paired tool_result (collapsed
+ * preview). Click to expand details. Iteration index is implicit in the
+ * order — they arrive in time order from the SSE stream.
+ */
+function AgentTrace({ steps }: { steps: AgentStep[] }) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+  return (
+    <div className="space-y-1 rounded-lg bg-palace-bg/40 px-2 py-2 text-[11px] ring-1 ring-palace-edge/60">
+      <div className="mb-1 text-[9px] font-semibold uppercase tracking-wider text-neutral-500">
+        Agent trace · {steps.length} step{steps.length === 1 ? "" : "s"}
+      </div>
+      {steps.map((s, i) => {
+        const key = `${s.tool_call_id}:${s.kind}:${i}`;
+        const isExpanded = expanded === key;
+        const isCall = s.kind === "tool_call";
+        const Icon = isCall ? "🔧" : s.ok ? "↩" : "✗";
+        const label = isCall
+          ? `${s.name}(${shortArgs(s.args)})`
+          : `${s.name} → ${s.ok ? "ok" : "error"} (${s.tool_ms}ms)`;
+        return (
+          <div key={key}>
+            <button
+              type="button"
+              onClick={() => setExpanded(isExpanded ? null : key)}
+              className={`flex w-full items-baseline gap-2 rounded px-1 py-0.5 text-left transition ${
+                isExpanded ? "bg-palace-edge/30" : "hover:bg-palace-edge/15"
+              }`}
+            >
+              <span className="w-3 shrink-0 text-center text-neutral-500">
+                {Icon}
+              </span>
+              <span
+                className={`flex-1 truncate ${
+                  isCall ? "text-neutral-300" : "text-neutral-400"
+                }`}
+              >
+                {label}
+              </span>
+              <span className="shrink-0 text-neutral-600">
+                +{s.elapsed_ms}ms
+              </span>
+            </button>
+            {isExpanded && (
+              <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-palace-bg p-2 text-[10px] text-neutral-400">
+                {isCall
+                  ? JSON.stringify(s.args, null, 2)
+                  : s.result_preview || "(empty)"}
+              </pre>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function shortArgs(args: Record<string, unknown>): string {
+  const entries = Object.entries(args);
+  if (entries.length === 0) return "";
+  return entries
+    .map(([k, v]) => {
+      const s = typeof v === "string" ? v : JSON.stringify(v);
+      const short = s.length > 30 ? s.slice(0, 29) + "…" : s;
+      return `${k}: ${short}`;
+    })
+    .join(", ");
 }

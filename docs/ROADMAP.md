@@ -52,16 +52,26 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [ ] **Recursive token-aware chunking** that respects markdown headings + paragraph boundaries.
 - [ ] **Redis + arq** — ingestion moves off the request path into background jobs.
 
-## P3 — Agents
+## P3 — Agents 🟡 ~20% shipped (P3.1)
 
 **Learning goal:** Tool-using agents, reflection loops, multi-step orchestration without LangChain.
 
-- [ ] Tool spec: `search_memory`, `read_node`, `link_nodes`, `summarize_cluster`, `create_node`
-- [ ] Memory agent: clusters related nodes, writes summaries as new nodes
-- [ ] Retrieval agent: rewrites queries, decides between vector / fulltext / graph traversal
-- [ ] Reflection loop: critique-and-retry on low-confidence retrievals
-- [ ] Research agent: takes a question, expands the graph from web results
-- [ ] Trace UI extended: same SSE channel carries `tool_call` / `tool_result` / `reflection` events
+### Shipped (P3.1)
+
+- [x] **Bare agent loop** — hand-written in `services/agent.py`, ~200 lines. OpenAI `tools` parameter, iteration cap (5), per-tool dispatch with in-band error handling, async-iterable for SSE streaming. ADR-020.
+- [x] **Read-only tool spec** — `search_memory`, `read_node`, `list_clusters`, `read_cluster_members`. Result size caps so context window stays bounded across iterations.
+- [x] **`POST /agent` endpoint** — separate from `/chat`. SSE events: `tool_call` / `tool_result` / `final` / `done`. Writes `chat_logs` rows with `is_agent=true` + full tool_calls jsonb.
+- [x] **ChatPanel agent-mode toggle** — checkbox routes between `/chat` and `/agent`. Trace UI renders each tool call as a collapsible row (icon + name + args, click to expand args/result).
+- [x] **Iteration-cap behavior** — when hit, agent makes one final no-tools LLM call to force a summary. Amber chip in UI surfaces the cap-hit case.
+- [x] Migration `0012_chat_logs_agent` — adds is_agent / agent_iterations / agent_tool_calls / agent_hit_iter_cap.
+
+### Remaining
+
+- [ ] **Reflection loop (P3.2)** — judge model critiques agent's final answer, agent retries if grounding score is low. New `EVAL_REFLECTION` flag in the harness.
+- [ ] **Write tools (P3.3)** — `create_summary_node`, `link_nodes` with confirmation UX, audit table, undo affordance. The "agent can mutate your graph" boundary.
+- [ ] **Memory agent (P3.4)** — autonomous curator. Runs from a button; later scheduled. Reviews clusters, proposes summary nodes.
+- [ ] **Research agent (P3.5)** — web fetch + search tools. Question expands the graph from external sources. Aggressive cost cap.
+- [ ] **Retrieval agent (variant)** — rewrites queries, decides between vector / fulltext / graph traversal. Could be a single specialized tool rather than a whole agent.
 
 ## P4 — Observability & quality
 

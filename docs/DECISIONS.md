@@ -80,6 +80,71 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-020 — Hand-written agent loop (no framework) — P3.1
+
+**Date:** 2026-05-15
+
+**Context.** P3 introduces tool-using agents — the model can call `search_memory`, `read_node`, `list_clusters`, `read_cluster_members` and reason in steps. Two real choices for how to build the loop: pull in LangChain (or LangGraph, or OpenAI Assistants API), or hand-roll on top of OpenAI's raw `tools` parameter.
+
+ADR-006 already chose "no LangChain through P3" for learning reasons. This ADR re-confirms that for the agent specifically and documents the implementation shape.
+
+**Decision.** Hand-written loop in `services/agent.py`, ~30 lines of real logic:
+
+```
+messages = [system, ...history, user_question]
+for iter in range(MAX_ITERATIONS):
+    resp = await openai.chat.completions.create(messages, tools=TOOL_SPECS)
+    msg = resp.choices[0].message
+    if not msg.tool_calls:
+        yield AgentFinalAnswer(msg.content); break
+    messages.append(msg)
+    for call in msg.tool_calls:
+        result = await dispatch_tool(call.name, parsed_args, ctx)
+        yield AgentToolCall(...) ; yield AgentToolResult(...)
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": ...})
+```
+
+Three guards baked in: `MAX_ITERATIONS=5` (cost ceiling), per-tool `try/except` returning `ok=False` (errors land in-band so the LLM can recover), `max_tokens=800` per LLM call (per-turn output cap).
+
+The loop is async-iterable so the router yields SSE events as they happen — `tool_call` / `tool_result` / `final` / `done`. Without this, the user stares at "Thinking..." for 10s while three tool calls run. With it, the trace UI fills in real-time.
+
+**Tools shipped (all read-only):**
+- `search_memory(query, k=5)` — wraps the existing graph-augmented retrieval. Returns top-k with node id, title, similarity, preview.
+- `read_node(node_id)` — full title + content + cluster label.
+- `list_clusters()` — all clusters with member counts.
+- `read_cluster_members(cluster_id)` — node ids + titles for one cluster.
+
+Write tools (create_summary_node, link_nodes) are deferred to P3.3 — the audit/confirmation/undo story is heavier than P3.1's scope.
+
+**Endpoint shape.** New `POST /agent` rather than a flag on `/chat`. Two reasons: cleaner separation in observability (`is_agent=true` column lets /insights split metrics), and the SSE protocol differs (agent emits tool_call/tool_result events that /chat doesn't have). Frontend toggle in ChatPanel routes between them.
+
+**Observability.** Migration `0012` adds `is_agent`, `agent_iterations`, `agent_tool_calls` (jsonb), `agent_hit_iter_cap` to `chat_logs`. /insights gets agent rows for free; tool_calls jsonb gives full per-step replay.
+
+**Why no framework.**
+- The agent loop is the highest-value thing to understand in the entire project for interview purposes. Frameworks abstract exactly the part you want to internalize.
+- LangChain has had ~3 major rewrites in 18 months. Code from 2024 doesn't run on current versions. Hand-rolled code is stable across OpenAI SDK minor bumps.
+- We can drop in framework code later if integration pain (research agent web fetchers, etc.) outweighs the cost. The decision is reversible per-feature.
+
+**Iteration cap behavior.** When the agent hits `MAX_ITERATIONS` without producing a final answer (no tool calls), we issue ONE more LLM call WITHOUT tools available — forces the model to summarize what it found instead of looping. The `agent_hit_iter_cap` flag lets /insights surface this case and the UI shows an amber chip rather than the normal violet one.
+
+**Consequence.**
+- Pro: ~200-line agent that does what 1000+ lines of framework code does, with full visibility into the message-history shape, the tool dispatch flow, and the cost guards.
+- Pro: Errors are in-band — a tool dispatch exception becomes a tool message the LLM reads. The LLM can decide to retry with different args or move on. We don't hard-code recovery logic.
+- Pro: Streaming SSE events for every loop step — UI sees the reasoning unfold in real time.
+- Pro: Adding a new tool is two changes (one schema entry, one dispatch function). No decorators, no registration ceremony.
+- Con: 3× cost vs `/chat` for a typical 3-iteration agent question (each iteration's input tokens include all prior tool results). Surfaced in the chip + /insights so users can see what they're paying for.
+- Con: 5-15s latency typical. Necessary for multi-step reasoning; mitigated by the trace UI showing progress.
+- Con: Token budget on an active conversation can balloon — a 5-iteration agent over a 6-message history with 4 tool calls each iteration approaches 4-8k input tokens. Manageable today; would need conversation summarization at higher load.
+- Con: Final answer is delivered as one `final` event (not token-streamed) on the agent path. /chat still streams tokens. Chose this for protocol simplicity; can revisit if UX feels too "blank then dump."
+
+**Future work (P3.2-3.5).**
+- 3.2: reflection loop — judge model critiques final answer, agent retries if low-grounded.
+- 3.3: write tools (create_summary_node, link_nodes) — gated behind a confirmation UX + audit table.
+- 3.4: memory agent — orchestrates the read-tools to propose summaries autonomously, runs as a button-triggered job (later, scheduled).
+- 3.5: research agent — adds web-fetch tools, expands the graph from external sources. Most ambitious, most cost-aware.
+
+---
+
 ## ADR-019 — Topic clustering: scalable substrate (Phase 1 — sklearn + members-hash)
 
 **Date:** 2026-05-15
