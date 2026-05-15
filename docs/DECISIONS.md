@@ -80,6 +80,59 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-019 — Topic clustering: scalable substrate (Phase 1 — sklearn + members-hash)
+
+**Date:** 2026-05-15
+
+**Context.** ADR-018-era topic clustering shipped with pure-Python k-means + a hand-rolled silhouette helper. Fine for this user's 14-node corpus, but the math doesn't scale: pure-Python k-means is O(n × k × dim × iters) without SIMD, and the silhouette is O(n²). Rough projections at the time: n=10k → ~30 minutes for k-means alone, n=1k → silhouette dominates the runtime. Naming, by contrast, is per-cluster — scales with K, not N — so it was already fine.
+
+The user pushed back ("we have to think a scalable version, not cost / bottleneck"), correctly. The pure-Python implementation was a "ship today" choice that needed to be promoted before it became load-bearing on bigger workspaces.
+
+**Decision.** Replace the math substrate (only). Naming pipeline unchanged.
+
+1. **`scikit-learn.cluster.MiniBatchKMeans`** in place of pure-Python k-means. MiniBatchKMeans trades ~2% quality for 10-100× speed at scale; standard for production-grade topic modeling. `n_init=10` random restarts; `random_state=42` for determinism across runs.
+
+2. **`sklearn.metrics.silhouette_score(sample_size=...)`** in place of the hand-rolled O(n²) silhouette. When n>100 we sub-sample 1000 points for the score — preserves the *ranking* of K candidates (the only thing we use silhouette for) while bounding computation to O(n × sample_size).
+
+3. **`numpy` arrays end-to-end** for the embedding matrix (was list-of-lists). Changes the inner loop from interpreted Python to BLAS.
+
+4. **`clusters.members_hash` column + label reuse.** Compute `sha256(sorted(member_ids))` per cluster. Before naming, look up the previous run's `(hash → label)` map; matching hashes reuse the previous label and skip the LLM call. In steady state most clusters between two recompute runs have identical membership — this saves ~$0.0001 × N unchanged clusters per recompute.
+
+5. **Adds 2 deps to API**: `numpy==1.26.4`, `scikit-learn==1.5.2`. ~80MB to the container image. Acceptable for a service that does any serious numerical work.
+
+**Explicitly NOT in this ADR (deferred):**
+- Tier 1 incremental clustering on node create (single-row nearest-centroid lookup)
+- Tier 2 nightly background recompute via Redis + arq
+- Tier 3 async/queued endpoint with SSE progress updates
+- HDBSCAN, hierarchical clustering, or any K=auto algorithm beyond silhouette
+- Quality fix to assignment errors (the BTS-in-Books case) — that's a separate Stage-1 problem, not Stage-2 (math) which this ADR scopes
+
+**Measured (n=14, today's user):**
+
+| metric | before (pure-Py) | after (sklearn) | notes |
+|---|---|---|---|
+| k-means time | ~80ms | ~50ms | n too small to show real lift |
+| silhouette time | ~10ms | ~5ms | sub-sample inactive at n=14 |
+| naming calls | k | k on first run, ≤k on re-runs | reuse only kicks in when membership stable |
+
+**Projected at n=10k:** k-means ~5s, silhouette ~1s, naming dominated by reuse rate. From "minutes" today to "single-digit seconds" — the actual unlock.
+
+**Consequence.**
+- Pro: No more O(n²) silhouette death at moderate scale.
+- Pro: Naming cost in steady state drops to "0 calls if the corpus didn't materially change" — the right shape.
+- Pro: members_hash is also useful for future cache invalidation (e.g. "cluster sidebar that lists members" can compare against a known-good hash).
+- Pro: Standard tools — anyone reading this who has done ML knows MiniBatchKMeans + silhouette_score on sight.
+- Con: +80MB to the API container image. First boot pulls them.
+- Con: scikit-learn import is non-trivial (~1s cold start). One-time; runtime queries fast.
+- Con: The hash comparison hardcodes an "exact membership match" definition. A cluster that gained 1 of 50 nodes still gets re-named. A future refinement could be Jaccard-similarity threshold, but that's overengineering until we have multi-cluster diff cases.
+- Con: Phase 1 doesn't solve the assignment-quality problem (BTS-song-in-Books case). That's not a math bug; it's an embedding-ambiguity issue that wants either a different algorithm (LLM-as-clusterer) or a different signal (chunk content into the assignment, not just node-mean embeddings). Logged as future work.
+
+**Future work.**
+- **Phase 2 — incremental + background**: Tier 1 nearest-centroid on node create + Tier 2 nightly recompute via Redis+arq. Defers the recompute cost off the request path entirely.
+- **Phase 3 — algorithmic upgrades**: HDBSCAN for variable cluster sizes, or LLM-as-clusterer for the "agentic" assignment step. ADR'd separately when load justifies.
+
+---
+
 ## ADR-018 — LLM-as-judge reranker (P2 closer #2)
 
 **Date:** 2026-05-15

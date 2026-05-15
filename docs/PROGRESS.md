@@ -326,3 +326,71 @@ Cases that moved to rank 1: `personal-relationship-japane` ("kenojo") was rank 5
 - **Cost guards matter as much as the feature itself.** The skip-on-clear-winner gate (sim gap > 0.10) means simple lookups don't pay for the rerank. Without it the reranker would burn $0.0001/turn on questions where vector retrieval already had the right answer locked in. Always design the skip case alongside the active case.
 - **Eval can't see all the wins.** The rerank fixed the live UI failure (LLM picking the wrong near-tie), but the eval would have shown that case as already-rank-1. Two separate quality dimensions: "is the right chunk in the candidate list?" (recall) and "does the LLM cite the right chunk?" (faithfulness). The latter needs an LLM-as-judge eval — that's a P4 item.
 - **Over-fetch is the unsung enabler of every reranker.** Without it (`fetch_k = body.k * 2 if rerank_enabled else body.k`), the reranker would just be reordering the same 5 chunks vector retrieval was going to send anyway. The win comes from giving it candidates 6-10 to potentially promote.
+
+---
+
+## 2026-05-15 — `(this commit)` — graph UI: search, hover details, clusters
+
+**Shipped:**
+- `NodeSearch` component — floating top-left search input. Live substring filter on titles, ↑/↓/Enter/Esc keyboard nav, "/" anywhere on the page focuses it. Picking a match selects the node AND flies the camera to it (~700ms ease).
+- Richer `nodeLabel` tooltip on hover — type, title, cluster name, content preview (truncated to 220 chars), all in one styled card.
+- New `linkLabel` tooltip on edges — kind badge (semantic/manual), weight as a percentage, source ↔ target node titles.
+- `lib/clusters.ts` — connected-components clustering on the weight-thresholded (≥0.4) semantic-edge subgraph. Deterministic IDs (smallest member id wins → stable across renders), 8-color palette, cluster label heuristic (most-common-first-word + member count, e.g. *"sumit (4)"*).
+- Node color now: selected (white) > cluster color (when ≥2-member cluster) > type color (singleton fallback).
+- Cluster legend in the canvas controls column — only renders when ≥1 cluster exists, shows color dot + label + member count per cluster.
+
+**What I learned:**
+- **Use the structure you already paid for before computing new structure.** I almost shipped k-means + LLM-named topics for the cluster feature. That would have meant a new endpoint, new embeddings round-trip, OpenAI cost per recompute, and a place to persist cluster names. But the auto-connect pipeline (best-pair-chunk + kNN + min-weight floor) had ALREADY computed a similarity graph. Connected components on that graph reads the structure for free. Cheaper, faster, deterministic, and good enough that we can upgrade to k-means later if useful.
+- **Threshold-then-cluster, not cluster-then-threshold.** Dropping weak edges *before* the BFS was load-bearing. With weak edges included, a single 0.27-weight chance match between two unrelated topics merged them into one giant blob — exactly the false-friend problem ADR-013 already solved at the *edge* layer. Reusing the same threshold (0.40, the medium-tier floor) keeps the cross-UI story consistent.
+- **Camera fly-to needs the post-sim node position, not the data position.** `data.nodes[i]` carries `x/y/z` mutated in place by the d3 sim (and by our per-frame oscillation). Reading those — not the original DB `nodes.x/y` — is what makes the camera land on the node where the user actually sees it.
+- **Singletons fall back gracefully.** Nodes that don't make it into any size-≥2 cluster keep their type color so the canvas doesn't go drab. Default-degrade is more important than the new-feature-everywhere instinct.
+- **Tooltips are an anti-clicking superpower.** I was about to fetch chunk counts on every hover (server roundtrip). Then realized hover is the *fast* affordance — if you want full details you click. Hover should answer "what is this?" in <0.1s; the sidebar answers "everything about this." Two tiers, two response budgets. Keeping hover lightweight (no DB calls) preserves the snappiness.
+
+---
+
+## 2026-05-15 — `(this commit)` — agentic topic clustering + Phase 1 scaling
+
+**Shipped:**
+- `services/clustering.py` — k-means on node-mean embeddings + per-cluster LLM naming. Two stages, deliberately split: deterministic math for grouping, one LLM call per cluster for the human-readable label. Defensive parsing with "Topic N" fallback.
+- Migration `0010_clusters` — dedicated `clusters` table (id / workspace_id / label / color / created_at), `nodes.cluster_id` FK with `on delete set null`, plus `workspace_node_embeddings(ws_id)` SQL function returning `(node_id, AVG(embedding))` for cheap server-side mean computation.
+- `POST /workspaces/{id}/recompute-clusters` endpoint — destructive on the workspace's clusters: pulls embeddings + titles, runs the service, deletes old clusters (cascades cluster_id → null), inserts new ones, updates each node's cluster_id.
+- Frontend: 🏷 Recompute topics button next to Auto-connect, status chip with k_chosen + silhouette + cost, server-side load of clusters on first paint, `dbClusters` slice in the Zustand store, `applyClusters` action.
+- Cluster focus interaction — clicking a cluster row in the legend dims all non-member nodes/edges to near-bg colors. Selection still wins over dim. Re-click or "clear" to reset.
+- **Phase 1 scaling refactor** (ADR-019): replaced pure-Python k-means with `sklearn.cluster.MiniBatchKMeans` + `sklearn.metrics.silhouette_score(sample_size=...)`. Added numpy + scikit-learn (~80MB to API image). Migration `0011` adds `clusters.members_hash` (sha256 of sorted member ids); the endpoint reuses the previous label when a cluster's hash matches an old one — saves the LLM cost on unchanged clusters in steady state.
+- `lib/clusters.ts` grows a `buildClusterIndexFromDb` adapter so the canvas treats DB-persisted (LLM-named) clusters and connected-components fallback identically. Renderer doesn't know which source produced the grouping.
+
+**Measured (n=14):**
+- First recompute: 4-5 LLM naming calls, ~$0.0005, 3-5s.
+- Repeat recompute on unchanged corpus: 0 LLM calls, $0, status chip reads "5 named, 5 reused" via members_hash.
+- After adding 1 node: K-means renegotiates partitions, most clusters get re-named (low reuse rate when membership shifts).
+
+**What I learned:**
+- **K-means + LLM-naming is the productive split for "agentic" topic clustering.** Letting the LLM do both jobs (group AND label) is ~10× more expensive and doesn't scale past ~100 nodes (token limit). Letting an algorithm do the math and the LLM do the writing is the clean separation: math gives precision, LLM gives readability. People sometimes call this a "small LLM workflow" or "agentic", honestly it's just well-chosen division of labor.
+- **`members_hash` is a cheap reuse mechanism that pays off in steady state.** When the user re-clicks Recompute without adding nodes, every cluster's hash matches → 0 LLM calls. The optimization is invisible until you watch the status chip ("5 named, 5 reused") — that's the point.
+- **K-means assigns by embedding proximity, not meaning.** Caught live with the user's data: a "BTS songs" note ended up in a Books cluster because both project as "personal preferences" in vector space. Fix isn't more math; it's letting the LLM read the actual content and reason. Logged for follow-up (LLM-as-clusterer).
+- **Don't hardcode user-specific data into infrastructure prompts.** I tried fixing a pronoun ambiguity by baking "Sumit/Raj/Carlos lean male" into the rerank prompt. User correctly called it out — that's product-specific data leaking into shared infrastructure code. A second user named Maria would get worse retrieval. Reverted. The right fix is workspace-scoped identity (deferred).
+- **Premature optimization wastes runway.** I almost shipped Redis+arq + nightly background jobs for clustering on a 14-node corpus. The user pushed back: "we have to think a scalable version, not cost / bottleneck." Right reframe — design the architecture, ship the implementation that fits today, document the scale-up path. ADR-019 captures the tiered architecture (online / periodic / on-demand) without prematurely building tiers we don't need yet.
+
+---
+
+## 2026-05-15 — `(this commit)` — URL ingestion cleanup + inline media previews
+
+**Shipped:**
+- `services/chunking.prepare_for_embedding(text)` — strips http(s) URLs from text before chunking. Called from both `/nodes/{id}/embed` and `/ingest`. The visible `nodes.content` keeps the URL (for display + the new MediaPreview); the embedded text doesn't include it.
+- `MediaPreview` component (frontend) — renders inline media in the sidebar based on node type:
+  - **doc + image mime** → `<img>` with signed-URL src
+  - **doc + application/pdf** → inline `<iframe>` (~360px tall, scroll inside)
+  - **url node** → detect platform from hostname:
+    - YouTube (`youtube.com`, `youtu.be`, `/shorts/`) → `https://www.youtube.com/embed/{id}` iframe
+    - Vimeo → `https://player.vimeo.com/video/{id}` iframe
+    - URL ending in image extension → `<img>`
+    - URL ending in `.pdf` → iframe
+    - everything else → clean "Open ↗" link card (no iframe — most sites X-Frame-Options:deny)
+- `db.createUploadSignedUrl(path, 3600s)` helper — mints a 1-hour signed URL from Supabase storage so the browser can render private uploads inline.
+- Sidebar mounts MediaPreview at the top of the form area, above Title.
+
+**What I learned:**
+- **The URL noise hypothesis was partially wrong.** I'd predicted that the YouTube URL in the BTS-song node would drown out the "Eijuuu likes this BTS song" caption in the embedding. After clustering re-ran with one new node, k-means correctly placed it next to the existing BTS note anyway — the prose signal was stronger than I thought. Stripping URLs is still the right call (cheap, more honest about what's semantically meaningful), but the "fix" wasn't the rescue I framed it as.
+- **Hover ≠ sidebar = different latency budgets.** I almost put media previews in hover tooltips. That would have meant: signed-URL roundtrip on every mouse pass, video autoplay flickers, perf death. Hover should answer "what is this?" in <0.1s with text only. Sidebar absorbs heavier work because it only fires on intentional click. Two response budgets, two surfaces.
+- **Most third-party sites can't be iframe-embedded.** X-Frame-Options:deny / CSP frame-ancestors:none. Trying to embed arbitrary URLs produces a broken iframe placeholder that's worse than a clean link card. Detect the platforms you can embed (YouTube, Vimeo, your own files), fall back to a respectful link for everything else. The "real preview of arbitrary pages" feature requires server-side Open Graph fetching — different scope.
+- **Signed URLs are private-storage's read primitive.** RLS protects the *row*, signed URLs protect the *object*. 1h expiry is the right default — long enough that a sidebar reading session works, short enough that a leaked link is useless.

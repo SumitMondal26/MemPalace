@@ -7,11 +7,13 @@ import { useEffect, useState } from "react";
 import AddNodeMenu from "@/components/AddNodeMenu";
 import ChatPanel from "@/components/ChatPanel";
 import GraphCanvas from "@/components/GraphCanvas";
+import NodeSearch from "@/components/NodeSearch";
 import Sidebar from "@/components/Sidebar";
+import type { Cluster } from "@/lib/clusters";
 import { EDGE_TIERS } from "@/lib/edgeTiers";
 import { api } from "@/lib/api";
 import * as db from "@/lib/db";
-import type { DbEdge, DbNode, NodeType } from "@/lib/db";
+import type { DbCluster, DbEdge, DbNode, NodeType } from "@/lib/db";
 import { supabase } from "@/lib/supabase";
 import { useGraphStore } from "@/lib/store";
 
@@ -22,12 +24,23 @@ type RebuildEdgesResponse = {
 
 type AutoConnectStatus = "idle" | "running" | "done" | "failed";
 
+type RecomputeClustersResponse = {
+  clusters_created: number;
+  k_chosen: number | null;
+  silhouette: number | null;
+  /** LLM naming calls actually issued. The rest were reused by members_hash. */
+  naming_calls: number;
+  naming_skipped: number;
+  cost_usd: number;
+};
+
 type Props = {
   userEmail: string;
   workspaceId: string;
   workspaceName: string;
   initialNodes: DbNode[];
   initialEdges: DbEdge[];
+  initialClusters: DbCluster[];
 };
 
 
@@ -58,11 +71,13 @@ export default function GraphPageClient({
   workspaceName,
   initialNodes,
   initialEdges,
+  initialClusters,
 }: Props) {
   const router = useRouter();
   const setInitial = useGraphStore((s) => s.setInitial);
   const upsertNode = useGraphStore((s) => s.upsertNode);
   const setEdges = useGraphStore((s) => s.setEdges);
+  const applyClusters = useGraphStore((s) => s.applyClusters);
   const selectNode = useGraphStore((s) => s.selectNode);
   const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
   const nodeCount = useGraphStore((s) => s.nodes.length);
@@ -71,16 +86,35 @@ export default function GraphPageClient({
   const [fitTrigger, setFitTrigger] = useState(0);
   const [autoConnect, setAutoConnect] = useState<AutoConnectStatus>("idle");
   const [autoConnectMsg, setAutoConnectMsg] = useState<string>("");
+  const [recompute, setRecompute] = useState<AutoConnectStatus>("idle");
+  const [recomputeMsg, setRecomputeMsg] = useState<string>("");
   const startDraft = useGraphStore((s) => s.startDraft);
   const draftType = useGraphStore((s) => s.draftType);
+
+  // Search → fly-to plumbing. Trigger increments per pick so the same
+  // node can be re-flown to (e.g. user picks it, drifts the camera, then
+  // re-clicks the same search match).
+  const [flyToNodeId, setFlyToNodeId] = useState<string | null>(null);
+  const [flyToTrigger, setFlyToTrigger] = useState(0);
+
+  // Connected-components fallback clusters — bubbled up from GraphCanvas
+  // when the workspace has no DB-persisted clusters yet. Once the user
+  // clicks "Recompute topics", DB clusters take over and this stays unused.
+  const [clusters, setClusters] = useState<Cluster[]>([]);
+
+  // Focused-cluster filter. When set, the canvas dims all non-cluster nodes
+  // and edges so the user can see one topic in isolation. Click again on
+  // the same legend row (or background) to clear.
+  const [focusedClusterId, setFocusedClusterId] = useState<string | null>(null);
 
   useEffect(() => {
     setInitial({
       workspaceId,
       nodes: initialNodes,
       edges: initialEdges,
+      dbClusters: initialClusters,
     });
-  }, [workspaceId, initialNodes, initialEdges, setInitial]);
+  }, [workspaceId, initialNodes, initialEdges, initialClusters, setInitial]);
 
   /** Auto-connect handler usable from anywhere — buttons, post-save chains. */
   async function runAutoConnect() {
@@ -115,14 +149,63 @@ export default function GraphPageClient({
     await runAutoConnect();
   }
 
+  /** "🏷 Recompute topics" — k-means + LLM-named clusters via the API. */
+  async function runRecomputeClusters() {
+    setRecompute("running");
+    setRecomputeMsg("");
+    try {
+      const res = await api<RecomputeClustersResponse>(
+        `/workspaces/${workspaceId}/recompute-clusters`,
+        { method: "POST" },
+      );
+      // Endpoint mutated nodes.cluster_id and replaced clusters table; refetch
+      // both so the canvas re-renders with the fresh ids/labels.
+      const [freshNodes, freshClusters] = await Promise.all([
+        db.listNodes(workspaceId),
+        db.listClusters(workspaceId),
+      ]);
+      applyClusters(freshNodes, freshClusters);
+      setRecompute("done");
+      const reuseFrag =
+        res.naming_skipped > 0
+          ? ` · ${res.naming_calls} named, ${res.naming_skipped} reused`
+          : "";
+      setRecomputeMsg(
+        `${res.clusters_created} topic${res.clusters_created === 1 ? "" : "s"}` +
+          (res.silhouette != null ? ` · silhouette ${res.silhouette.toFixed(2)}` : "") +
+          reuseFrag +
+          ` · $${res.cost_usd.toFixed(4)}`,
+      );
+      setTimeout(() => setRecompute("idle"), 5000);
+    } catch (e) {
+      setRecompute("failed");
+      setRecomputeMsg(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   const sidebarOpen = !!selectedNodeId || !!draftType;
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-palace-bg">
       {/* Canvas — fills the entire viewport */}
       <div className="absolute inset-0">
-        <GraphCanvas showGrid={showGrid} fitTrigger={fitTrigger} />
+        <GraphCanvas
+          showGrid={showGrid}
+          fitTrigger={fitTrigger}
+          flyToNodeId={flyToNodeId}
+          flyToTrigger={flyToTrigger}
+          onClustersChange={setClusters}
+          focusedClusterId={focusedClusterId}
+        />
       </div>
+
+      {/* Floating search — top-left under the header */}
+      <NodeSearch
+        onPick={(id) => {
+          setFlyToNodeId(id);
+          setFlyToTrigger((t) => t + 1);
+        }}
+      />
 
       {/* Floating header with workspace + add-node + sign-out */}
       <header className="absolute left-0 right-0 top-0 z-20 flex items-center justify-between border-b border-palace-edge/60 bg-palace-bg/70 px-6 py-3 backdrop-blur-md">
@@ -187,6 +270,26 @@ export default function GraphPageClient({
           </span>
         )}
 
+        {/* Topic clustering — k-means on node embeddings + LLM-named labels */}
+        <button
+          onClick={runRecomputeClusters}
+          disabled={recompute === "running"}
+          className="rounded-lg bg-violet-500/15 px-3 py-1.5 text-xs font-medium text-violet-300 ring-1 ring-violet-500/40 backdrop-blur hover:bg-violet-500/25 disabled:opacity-60"
+          title="Group nodes into topics by content similarity, then ask gpt-4o-mini to name each group"
+        >
+          {recompute === "running" ? "Clustering…" : "🏷 Recompute topics"}
+        </button>
+        {recompute === "done" && recomputeMsg && (
+          <span className="rounded-md bg-emerald-950/40 px-2 py-1 text-[11px] text-emerald-300 ring-1 ring-emerald-900/60">
+            ✓ {recomputeMsg}
+          </span>
+        )}
+        {recompute === "failed" && recomputeMsg && (
+          <span className="max-w-[260px] truncate rounded-md bg-red-950/40 px-2 py-1 text-[11px] text-red-300 ring-1 ring-red-900/60">
+            {recomputeMsg}
+          </span>
+        )}
+
         {/* Edge-strength legend */}
         <div className="mt-1 space-y-1 rounded-lg bg-palace-panel/80 px-3 py-2 text-[10px] text-neutral-300 ring-1 ring-palace-edge backdrop-blur">
           <div className="mb-1 text-[9px] font-semibold uppercase tracking-wider text-neutral-500">
@@ -208,6 +311,60 @@ export default function GraphPageClient({
             range={`${EDGE_TIERS.weak.min.toFixed(2)}–${EDGE_TIERS.medium.min.toFixed(2)}`}
           />
         </div>
+
+        {/* Cluster legend — clickable. Each row toggles "focus this cluster":
+            the canvas dims all non-member nodes and edges so the topic stands
+            out. Re-clicking the active row (or any row) clears the focus. */}
+        {clusters.length > 0 && (
+          <div className="space-y-1 rounded-lg bg-palace-panel/80 px-3 py-2 text-[10px] text-neutral-300 ring-1 ring-palace-edge backdrop-blur">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="text-[9px] font-semibold uppercase tracking-wider text-neutral-500">
+                Clusters ({clusters.length})
+              </span>
+              {focusedClusterId && (
+                <button
+                  onClick={() => setFocusedClusterId(null)}
+                  className="text-[9px] uppercase tracking-wider text-neutral-500 hover:text-neutral-200"
+                  title="Clear cluster focus"
+                >
+                  clear
+                </button>
+              )}
+            </div>
+            {clusters.map((c) => {
+              const focused = c.id === focusedClusterId;
+              const dimmed = focusedClusterId != null && !focused;
+              return (
+                <button
+                  key={c.id}
+                  type="button"
+                  onClick={() =>
+                    setFocusedClusterId(focused ? null : c.id)
+                  }
+                  className={`flex w-full items-center gap-2 rounded px-1 py-0.5 text-left transition ${
+                    focused
+                      ? "bg-palace-accent/15 ring-1 ring-palace-accent/50"
+                      : dimmed
+                        ? "opacity-40 hover:opacity-100"
+                        : "hover:bg-palace-bg/60"
+                  }`}
+                  title={
+                    focused
+                      ? "Focused — click to clear"
+                      : `Focus on ${c.label}`
+                  }
+                >
+                  <span
+                    className="inline-block h-2 w-2 rounded-full"
+                    style={{ background: c.color }}
+                  />
+                  <span className="flex-1 truncate">{c.label}</span>
+                  <span className="text-neutral-600">{c.members.length}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Sidebar — slides in from the right when a node is selected */}

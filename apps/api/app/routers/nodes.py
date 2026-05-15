@@ -30,7 +30,7 @@ from supabase import Client
 
 from ..deps import get_user_id, openai_client, supabase_admin, supabase_user
 from ..schemas import IngestResponse
-from ..services.chunking import chunk_text
+from ..services.chunking import chunk_text, prepare_for_embedding
 from ..services.embeddings import embed_batch
 
 router = APIRouter()
@@ -68,7 +68,14 @@ async def embed_node(
     if not content:
         return IngestResponse(chunks_created=0, total_tokens=0)
 
-    chunks = chunk_text(content)
+    # Strip URLs etc. before chunking — see services/chunking.prepare_for_embedding.
+    # Keeps `nodes.content` intact (used for display + the URL preview in the
+    # sidebar) but feeds the embedder only the prose carrying real signal.
+    cleaned = prepare_for_embedding(content)
+    if not cleaned:
+        return IngestResponse(chunks_created=0, total_tokens=0)
+
+    chunks = chunk_text(cleaned)
     if not chunks:
         return IngestResponse(chunks_created=0, total_tokens=0)
 

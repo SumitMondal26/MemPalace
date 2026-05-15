@@ -16,10 +16,21 @@ export type DbNode = {
   title: string | null;
   content: string | null;
   metadata: Record<string, unknown>;
+  /** FK into clusters.id, or null when this node hasn't been clustered yet
+   *  (brand-new, or workspace never ran "Recompute topics"). */
+  cluster_id: string | null;
   x: number;
   y: number;
   created_at: string;
   updated_at: string;
+};
+
+export type DbCluster = {
+  id: string;
+  workspace_id: string;
+  label: string;
+  color: string | null;
+  created_at: string;
 };
 
 export type DbEdge = {
@@ -142,6 +153,19 @@ export async function deleteEdge(id: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Clusters (LLM-named topic groupings — see services/clustering.py)
+// ---------------------------------------------------------------------------
+
+export async function listClusters(workspaceId: string): Promise<DbCluster[]> {
+  const { data, error } = await supabase()
+    .from("clusters")
+    .select("*")
+    .eq("workspace_id", workspaceId);
+  if (error) throw error;
+  return data as DbCluster[];
+}
+
+// ---------------------------------------------------------------------------
 // Per-node state lookups (for the Sidebar to surface "what's already there")
 // ---------------------------------------------------------------------------
 
@@ -152,6 +176,27 @@ export async function getNodeChunkCount(nodeId: string): Promise<number> {
     .eq("node_id", nodeId);
   if (error) throw error;
   return count ?? 0;
+}
+
+/**
+ * Mint a short-lived signed URL for a private storage object so the
+ * browser can render it inline (PDF iframe, image src, etc.). RLS still
+ * applies on the row that *links* to the storage path; storage objects
+ * themselves are protected by signed-URL expiry.
+ *
+ * Default 1h expiry — long enough for the user to read a PDF without
+ * the iframe going stale, short enough that the link is useless if
+ * leaked. Bump to 24h via the `expiresIn` arg if needed.
+ */
+export async function createUploadSignedUrl(
+  storagePath: string,
+  expiresIn: number = 3600,
+): Promise<string | null> {
+  const { data, error } = await supabase()
+    .storage.from("uploads")
+    .createSignedUrl(storagePath, expiresIn);
+  if (error || !data?.signedUrl) return null;
+  return data.signedUrl;
 }
 
 export async function getLatestUpload(

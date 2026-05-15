@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
+import { type ClusterIndex, buildClusters, buildClusterIndexFromDb } from "@/lib/clusters";
 import { semanticEdgeColor } from "@/lib/edgeTiers";
 import { useGraphStore } from "@/lib/store";
 
@@ -37,31 +38,72 @@ const TYPE_COLOR: Record<string, string> = {
 const FALLBACK_COLOR = "#7c5cff";
 const SELECTED_COLOR = "#ffffff";
 const MANUAL_EDGE_COLOR = "#3b3d52";
+// Near-background tint for nodes/edges outside the focused cluster.
+// Just above the canvas bg (#0a0a0f) so they're still hit-testable but
+// visually recede. Aligned to palace-edge so it reads as "structural".
+const DIMMED_NODE_COLOR = "#1f2230";
+const DIMMED_LINK_COLOR = "#15171f";
+
+/** Resolve a link endpoint id whether the lib has hydrated it to a node
+ *  reference (post-sim) or kept it as a raw id string (pre-sim / pre-render). */
+function endpointId(end: string | { id?: string }): string {
+  return typeof end === "string" ? end : end?.id ?? "";
+}
 
 // Edge tiers + color function live in lib/edgeTiers.ts so the legend in
 // GraphPageClient reads from the same source of truth (see import above).
 
-type GNode = { id: string; type: string; title: string | null };
+type GNode = {
+  id: string;
+  type: string;
+  title: string | null;
+  content: string | null;
+  /** Cluster color, when this node belongs to a cluster. null = singleton. */
+  clusterColor: string | null;
+  clusterLabel: string | null;
+};
 type GLink = {
   source: string;
   target: string;
   kind: "manual" | "semantic";
   weight: number;
+  /** Endpoint titles materialized at data-build time for the hover tooltip. */
+  sourceTitle: string;
+  targetTitle: string;
 };
 
 type FGRef = {
   scene?: () => THREE.Scene;
   camera?: () => THREE.PerspectiveCamera;
   zoomToFit?: (duration?: number, padding?: number) => void;
+  cameraPosition?: (
+    pos: { x: number; y: number; z: number },
+    lookAt?: { x: number; y: number; z: number },
+    ms?: number,
+  ) => void;
 };
 
 export default function GraphCanvas({
   showGrid,
   fitTrigger,
+  flyToNodeId,
+  flyToTrigger,
+  onClustersChange,
+  focusedClusterId,
 }: {
   showGrid: boolean;
   /** Increment to re-run zoom-to-fit imperatively from the parent. */
   fitTrigger: number;
+  /** Node id to fly the camera to when flyToTrigger changes. */
+  flyToNodeId: string | null;
+  /** Increment to re-trigger fly-to (so picking the same node twice re-flies). */
+  flyToTrigger: number;
+  /** Notified whenever the cluster index recomputes so the parent can render
+   *  a legend without recomputing clusters itself. */
+  onClustersChange?: (clusters: ClusterIndex["clusters"]) => void;
+  /** When non-null, dim all nodes/edges not part of this cluster. The cluster
+   *  legend in the parent toggles this. */
+  focusedClusterId?: string | null;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const fgRef = useRef<FGRef | null>(null);
@@ -69,6 +111,7 @@ export default function GraphCanvas({
 
   const dbNodes = useGraphStore((s) => s.nodes);
   const dbEdges = useGraphStore((s) => s.edges);
+  const dbClusters = useGraphStore((s) => s.dbClusters);
   const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
   const selectNode = useGraphStore((s) => s.selectNode);
 
@@ -221,22 +264,56 @@ export default function GraphCanvas({
     };
   }, [showGrid]);
 
-  const data = useMemo(
-    () => ({
-      nodes: dbNodes.map<GNode>((n) => ({
-        id: n.id,
-        type: n.type,
-        title: n.title,
-      })),
+  // Cluster index — prefers DB-persisted (LLM-named) clusters when the
+  // workspace has them, falls back to client-side connected-components on
+  // weight-thresholded semantic edges. The fallback gives useful structure
+  // before the user clicks "Recompute topics" the first time.
+  const clusterIndex = useMemo(() => {
+    if (dbClusters.length > 0) {
+      return buildClusterIndexFromDb(dbNodes, dbClusters);
+    }
+    return buildClusters(dbNodes, dbEdges);
+  }, [dbClusters, dbNodes, dbEdges]);
+
+  // Notify parent about cluster set so it can render a legend.
+  useEffect(() => {
+    onClustersChange?.(clusterIndex.clusters);
+  }, [clusterIndex, onClustersChange]);
+
+  // Membership set of the focused cluster (if any), as a Set for O(1)
+  // checks during the per-link / per-node opacity callbacks. Recomputed
+  // only when the focus changes or the cluster index re-builds.
+  const focusedMembers = useMemo(() => {
+    if (!focusedClusterId) return null;
+    const c = clusterIndex.clusters.find((x) => x.id === focusedClusterId);
+    return c ? new Set(c.members) : null;
+  }, [focusedClusterId, clusterIndex]);
+
+  const data = useMemo(() => {
+    const titleById = new Map<string, string>();
+    for (const n of dbNodes) titleById.set(n.id, n.title || "(untitled)");
+    return {
+      nodes: dbNodes.map<GNode>((n) => {
+        const c = clusterIndex.byNode.get(n.id) ?? null;
+        return {
+          id: n.id,
+          type: n.type,
+          title: n.title,
+          content: n.content,
+          clusterColor: c?.color ?? null,
+          clusterLabel: c?.label ?? null,
+        };
+      }),
       links: dbEdges.map<GLink>((e) => ({
         source: e.source_id,
         target: e.target_id,
         kind: e.kind,
         weight: e.weight ?? 0.5,
+        sourceTitle: titleById.get(e.source_id) ?? "(unknown)",
+        targetTitle: titleById.get(e.target_id) ?? "(unknown)",
       })),
-    }),
-    [dbNodes, dbEdges],
-  );
+    };
+  }, [dbNodes, dbEdges, clusterIndex]);
 
   // Padding in pixels controls how much empty margin sits around the
   // bounding box of all nodes. Smaller = tighter zoom. We aim for ~70%
@@ -257,6 +334,28 @@ export default function GraphCanvas({
     fgRef.current?.zoomToFit?.(500, fitPadding);
   }, [fitTrigger, fitPadding]);
 
+  // Imperative camera fly-to-node — bumped when a search match is picked.
+  // We read the node's three.js position (set by the d3 sim + per-frame
+  // oscillation in nodePositionUpdate). It's `node.x/y/z` on the data array
+  // entry. The lib mutates these in place each tick.
+  useEffect(() => {
+    if (flyToTrigger <= 0 || !flyToNodeId) return;
+    const target = (data.nodes as Array<GNode & { x?: number; y?: number; z?: number }>).find(
+      (n) => n.id === flyToNodeId,
+    );
+    if (!target || target.x == null) return;
+    const distance = 200;
+    // Pull the camera back along the +Z axis from the node so the user sees
+    // the node head-on (rather than landing inside it).
+    const cam = {
+      x: target.x,
+      y: target.y ?? 0,
+      z: (target.z ?? 0) + distance,
+    };
+    const lookAt = { x: target.x, y: target.y ?? 0, z: target.z ?? 0 };
+    fgRef.current?.cameraPosition?.(cam, lookAt, 700);
+  }, [flyToTrigger, flyToNodeId, data.nodes]);
+
   return (
     <div ref={containerRef} className="h-full w-full">
       {/* @ts-expect-error - dynamic-imported component types don't carry through cleanly */}
@@ -270,37 +369,101 @@ export default function GraphCanvas({
         nodeOpacity={0.9}
         nodeResolution={20}
         nodeVal={(n: GNode) => (n.id === selectedNodeId ? 12 : 6)}
-        nodeColor={(n: GNode) =>
-          n.id === selectedNodeId
-            ? SELECTED_COLOR
-            : (TYPE_COLOR[n.type] ?? FALLBACK_COLOR)
-        }
-        nodeLabel={(n: GNode) =>
-          `<div style="background:rgba(17,18,26,0.95);color:#e5e5e5;padding:6px 10px;border-radius:6px;font-size:11px;border:1px solid #2a2d3f;box-shadow:0 4px 12px rgba(0,0,0,0.5);">` +
-          `<div style="opacity:0.6;text-transform:uppercase;letter-spacing:0.05em;font-size:9px;color:${TYPE_COLOR[n.type] ?? FALLBACK_COLOR}">${n.type}</div>` +
-          `<div style="margin-top:2px">${escapeHtml(n.title || "Untitled")}</div>` +
-          `</div>`
-        }
+        nodeColor={(n: GNode) => {
+          if (n.id === selectedNodeId) return SELECTED_COLOR;
+          // When a cluster is focused, dim non-members by returning a
+          // near-background color. This is a stronger signal than tweaking
+          // opacity (which the lib only supports uniformly).
+          if (focusedMembers && !focusedMembers.has(n.id)) return DIMMED_NODE_COLOR;
+          // Cluster color wins over type color when the node belongs to a
+          // cluster (size >= 2 of weight-thresholded semantic neighbors).
+          // Singletons fall back to type-color so the canvas doesn't go drab.
+          return n.clusterColor ?? TYPE_COLOR[n.type] ?? FALLBACK_COLOR;
+        }}
+        nodeLabel={(n: GNode) => {
+          // Inlined helpers — react-force-graph re-evaluates callbacks in a
+          // way that loses references to module-scoped functions after Fast
+          // Refresh. Keep everything self-contained.
+          const esc = (s: string) =>
+            s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+          const trunc = (s: string, m: number) => (s.length <= m ? s : s.slice(0, m - 1) + "…");
+
+          const accent = n.clusterColor ?? TYPE_COLOR[n.type] ?? FALLBACK_COLOR;
+          const preview = (n.content || "").trim();
+          const previewHtml = preview
+            ? `<div style="margin-top:6px;color:#a3a3a3;line-height:1.35;max-width:320px">${esc(trunc(preview, 220))}</div>`
+            : `<div style="margin-top:6px;color:#525252;font-style:italic">no content</div>`;
+          const clusterLine = n.clusterLabel
+            ? `<div style="margin-top:4px;font-size:9px;color:${accent};opacity:0.85">cluster: ${esc(n.clusterLabel)}</div>`
+            : "";
+          return (
+            `<div style="background:rgba(17,18,26,0.96);color:#e5e5e5;padding:8px 12px;border-radius:8px;font-size:11px;border:1px solid #2a2d3f;box-shadow:0 6px 18px rgba(0,0,0,0.6);max-width:340px">` +
+            `<div style="opacity:0.65;text-transform:uppercase;letter-spacing:0.05em;font-size:9px;color:${accent}">${n.type}</div>` +
+            `<div style="margin-top:2px;font-weight:500">${esc(n.title || "Untitled")}</div>` +
+            clusterLine +
+            previewHtml +
+            `</div>`
+          );
+        }}
+        linkLabel={(l: GLink) => {
+          const esc = (s: string) =>
+            s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+          const trunc = (s: string, m: number) => (s.length <= m ? s : s.slice(0, m - 1) + "…");
+
+          const pct = `${(l.weight * 100).toFixed(0)}%`;
+          const kindBadge =
+            l.kind === "semantic"
+              ? `<span style="color:${semanticEdgeColor(l.weight)};text-transform:uppercase;font-size:9px;letter-spacing:0.05em">semantic</span>`
+              : `<span style="color:#94a3b8;text-transform:uppercase;font-size:9px;letter-spacing:0.05em">manual</span>`;
+          return (
+            `<div style="background:rgba(17,18,26,0.96);color:#e5e5e5;padding:6px 10px;border-radius:6px;font-size:11px;border:1px solid #2a2d3f;box-shadow:0 4px 12px rgba(0,0,0,0.5);max-width:320px">` +
+            `<div style="display:flex;align-items:baseline;gap:8px">${kindBadge}<span style="opacity:0.6">weight</span><span style="font-weight:500">${pct}</span></div>` +
+            `<div style="margin-top:4px;color:#a3a3a3;font-size:10px">${esc(trunc(l.sourceTitle, 60))} ↔ ${esc(trunc(l.targetTitle, 60))}</div>` +
+            `</div>`
+          );
+        }}
         // Weight-modulated rendering: stronger semantic edges look stronger.
         // Color gradient (cool-dim → bright-magenta) for instant strength
-        // readability; width/opacity/particles also scale with weight.
+        // readability; width/particles also scale with weight.
         // Manual edges keep a flat dim appearance.
-        linkColor={(l: GLink) =>
-          l.kind === "semantic"
+        // When a cluster is focused, only edges with BOTH endpoints in the
+        // cluster keep their full appearance. Bridging edges and outside
+        // edges fade to near-bg so the cluster's internal structure pops.
+        linkColor={(l: GLink) => {
+          if (focusedMembers) {
+            const a = endpointId(l.source);
+            const b = endpointId(l.target);
+            if (!focusedMembers.has(a) || !focusedMembers.has(b)) {
+              return DIMMED_LINK_COLOR;
+            }
+          }
+          return l.kind === "semantic"
             ? semanticEdgeColor(l.weight)
-            : MANUAL_EDGE_COLOR
-        }
-        linkWidth={(l: GLink) =>
-          l.kind === "semantic"
+            : MANUAL_EDGE_COLOR;
+        }}
+        linkWidth={(l: GLink) => {
+          if (focusedMembers) {
+            const a = endpointId(l.source);
+            const b = endpointId(l.target);
+            if (!focusedMembers.has(a) || !focusedMembers.has(b)) return 0.2;
+          }
+          return l.kind === "semantic"
             ? 0.3 + Math.max(0, l.weight - 0.2) * 2.2
-            : 0.4
-        }
+            : 0.4;
+        }}
         linkOpacity={0.75}
-        linkDirectionalParticles={(l: GLink) =>
-          l.kind === "semantic" && l.weight >= 0.35
+        linkDirectionalParticles={(l: GLink) => {
+          // Kill particle traffic on dimmed edges — animation noise where
+          // we want quiet.
+          if (focusedMembers) {
+            const a = endpointId(l.source);
+            const b = endpointId(l.target);
+            if (!focusedMembers.has(a) || !focusedMembers.has(b)) return 0;
+          }
+          return l.kind === "semantic" && l.weight >= 0.35
             ? Math.min(4, Math.ceil((l.weight - 0.2) * 5))
-            : 0
-        }
+            : 0;
+        }}
         linkDirectionalParticleSpeed={0.006}
         linkDirectionalParticleWidth={(l: GLink) =>
           l.kind === "semantic" ? 1.2 + l.weight * 1.5 : 1.5
@@ -407,11 +570,3 @@ export default function GraphCanvas({
   );
 }
 
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}

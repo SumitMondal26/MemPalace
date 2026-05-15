@@ -25,7 +25,7 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [x] Relevance threshold filter on retrieved chunks (0.4) so chat replies conversationally on out-of-context queries instead of hallucinating "I don't have that"
 - [x] Sidebar slides in from the right on node-select; closes on background click
 
-## P2 — Smarter retrieval 🟢 ~90% shipped
+## P2 — Smarter retrieval 🟢 ~95% shipped
 
 **Learning goal:** Real retrieval engineering — chunking strategies, reranking, evals, graph-augmented retrieval, observability.
 
@@ -42,6 +42,9 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [x] **Unified add-memory flow** — single "+ Add memory ▸" button → dropdown → type-aware draft form rendered inside the sidebar (no modal layer). Save chains automatically: persist → embed → auto-connect → refresh edges. Zero clicks-to-connect.
 - [x] **Query rewriting for multi-turn** — one LLM call (gpt-4o-mini, JSON mode, temp 0) rewrites vague follow-ups into standalone search queries before embedding. Closes the ADR-014 weakness. Measured A/B on 20-case golden: recall@1 80→85%, MRR 0.885→0.910 with no regressions. Skipped on single-turn (zero added cost).
 - [x] **Reranking (LLM-as-judge)** — over-fetch 2× from retrieval, then send top-N (max 8) candidates + question to gpt-4o-mini with JSON output mode, get back ranked indices, reorder, take top-K. Auto-skips on clear winner (similarity gap > 0.10) and on parse/API failure. Measured A/B on 21-case golden: recall@1 85.71→**95.24%** (+9.5pp), MRR 0.914→**0.976** (+0.062). Three cases flipped to rank 1 (kenojo from rank 5!).
+- [x] **Agentic topic clustering** (pulled forward from P3) — `POST /workspaces/{id}/recompute-clusters` runs k-means on node-mean embeddings (sklearn MiniBatchKMeans) + LLM-named labels (gpt-4o-mini per cluster). Phase 1 scaling: numpy + sklearn substrate, sub-sampled silhouette for K selection, `members_hash` reuse so unchanged clusters skip the LLM call. Cluster colors + clickable legend with focus-others-dim interaction. ADR-019.
+- [x] **Graph UI sweep** — substring-search top-left with /-shortcut + camera fly-to, richer hover tooltips (node content preview, edge weight + endpoints), cluster legend, focus-on-cluster-click dimming.
+- [x] **Smarter URL ingestion + inline media previews** — `prepare_for_embedding()` strips URLs from text before chunking (URLs are nonsense tokens to the embedder; the visible content keeps them). New `MediaPreview` in the sidebar: YouTube/Vimeo embeds, inline PDF iframe, image preview, generic-URL link card. Signed-URL helper for private uploads.
 
 ### Remaining (still P2)
 

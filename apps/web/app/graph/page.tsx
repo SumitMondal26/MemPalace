@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 
 import { supabaseServer } from "@/lib/supabase-server";
-import type { DbEdge, DbNode } from "@/lib/db";
+import type { DbCluster, DbEdge, DbNode } from "@/lib/db";
 import GraphPageClient from "./GraphPageClient";
 
 /**
@@ -29,9 +29,10 @@ export default async function GraphPage() {
     redirect("/login");
   }
 
-  const [nodesRes, edgesRes] = await Promise.all([
+  const [nodesRes, edgesRes, clustersRes] = await Promise.all([
     sb.from("nodes").select("*").eq("workspace_id", workspace.id),
     sb.from("edges").select("*").eq("workspace_id", workspace.id),
+    sb.from("clusters").select("*").eq("workspace_id", workspace.id),
   ]);
 
   return (
@@ -41,6 +42,7 @@ export default async function GraphPage() {
       workspaceName={workspace.name}
       initialNodes={(nodesRes.data ?? []) as DbNode[]}
       initialEdges={(edgesRes.data ?? []) as DbEdge[]}
+      initialClusters={(clustersRes.data ?? []) as DbCluster[]}
     />
   );
 }

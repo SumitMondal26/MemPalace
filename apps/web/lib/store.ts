@@ -12,12 +12,16 @@
  */
 
 import { create } from "zustand";
-import type { DbEdge, DbNode, NodeType } from "./db";
+import type { DbCluster, DbEdge, DbNode, NodeType } from "./db";
 
 type State = {
   workspaceId: string | null;
   nodes: DbNode[];
   edges: DbEdge[];
+  /** LLM-named topic clusters from the recompute-clusters endpoint. Empty
+   *  when the workspace has never been clustered — the GraphCanvas falls
+   *  back to connected-components in that case. */
+  dbClusters: DbCluster[];
   selectedNodeId: string | null;
   /** When set, the sidebar renders a new-node form for this type. */
   draftType: NodeType | null;
@@ -28,12 +32,17 @@ type Actions = {
     workspaceId: string;
     nodes: DbNode[];
     edges: DbEdge[];
+    dbClusters?: DbCluster[];
   }) => void;
   upsertNode: (n: DbNode) => void;
   removeNode: (id: string) => void;
   upsertEdge: (e: DbEdge) => void;
   removeEdge: (id: string) => void;
   setEdges: (edges: DbEdge[]) => void;
+  setDbClusters: (clusters: DbCluster[]) => void;
+  /** After recompute-clusters runs, refresh nodes (cluster_id changed) +
+   *  clusters in one atomic store write so the canvas re-renders consistently. */
+  applyClusters: (nodes: DbNode[], clusters: DbCluster[]) => void;
   selectNode: (id: string | null) => void;
   startDraft: (type: NodeType) => void;
   cancelDraft: () => void;
@@ -43,11 +52,12 @@ export const useGraphStore = create<State & Actions>((set) => ({
   workspaceId: null,
   nodes: [],
   edges: [],
+  dbClusters: [],
   selectedNodeId: null,
   draftType: null,
 
-  setInitial: ({ workspaceId, nodes, edges }) =>
-    set({ workspaceId, nodes, edges }),
+  setInitial: ({ workspaceId, nodes, edges, dbClusters }) =>
+    set({ workspaceId, nodes, edges, dbClusters: dbClusters ?? [] }),
 
   upsertNode: (n) =>
     set((s) => {
@@ -82,6 +92,10 @@ export const useGraphStore = create<State & Actions>((set) => ({
     set((s) => ({ edges: s.edges.filter((e) => e.id !== id) })),
 
   setEdges: (edges) => set({ edges }),
+
+  setDbClusters: (clusters) => set({ dbClusters: clusters }),
+
+  applyClusters: (nodes, clusters) => set({ nodes, dbClusters: clusters }),
 
   // Selecting a node always clears any in-progress draft (mutually exclusive).
   selectNode: (id) => set({ selectedNodeId: id, draftType: null }),

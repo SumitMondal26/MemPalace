@@ -20,7 +20,7 @@ from supabase import Client
 
 from ..deps import get_user_id, openai_client, supabase_admin, supabase_user
 from ..schemas import IngestRequest, IngestResponse
-from ..services.chunking import chunk_text
+from ..services.chunking import chunk_text, prepare_for_embedding
 from ..services.embeddings import embed_batch
 from ..services.extract import extract_text
 
@@ -68,8 +68,9 @@ async def ingest(
         # 3. Download from Storage (service role).
         file_bytes = sb_admin.storage.from_("uploads").download(body.storage_path)
 
-        # 4. Extract → chunk → embed.
+        # 4. Extract → strip URLs → chunk → embed.
         text = extract_text(file_bytes, body.mime_type)
+        text = prepare_for_embedding(text)
         chunks = chunk_text(text)
         if not chunks:
             raise HTTPException(

@@ -6,6 +6,7 @@ import { api } from "@/lib/api";
 import * as db from "@/lib/db";
 import type { DbUpload, NodeType } from "@/lib/db";
 import { useGraphStore } from "@/lib/store";
+import MediaPreview from "./MediaPreview";
 import UploadDropzone from "./UploadDropzone";
 
 type IndexStatus = "idle" | "indexing" | "indexed" | "failed";
@@ -228,6 +229,10 @@ export default function Sidebar() {
       </header>
 
       <div className="flex-1 space-y-3 overflow-auto p-4">
+        {/* Inline media preview — YouTube embed, PDF iframe, image, etc.
+            Renders nothing for plain notes with no detectable media. */}
+        <MediaPreview node={node} upload={upload} />
+
         <label className="block text-xs font-medium text-neutral-400">
           Title
           <input
