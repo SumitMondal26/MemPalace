@@ -275,7 +275,7 @@ This is **not** a changelog (those are version-anchored). This is a **learning l
 
 ---
 
-## 2026-05-15 — `5a23188` + (this commit) — golden set 8→20, query rewriting on multi-turn
+## 2026-05-15 — `5a23188` + `28bbd7e` — golden set 8→20, query rewriting on multi-turn
 
 **Shipped:**
 - Golden eval set expanded 8 → 20 cases. New mix: more single-shot lookups, multi-node expansions (`cross-doc-ai-books`, `vague-partner`), long-doc paper retrievals (5 transformer-paper queries), and two pronoun-only "litmus" cases that exist specifically to measure query rewriting (`vague-partner`, `vague-her-age`). Cases that need it now carry an inline `history` field.
@@ -302,7 +302,7 @@ This is **not** a changelog (those are version-anchored). This is a **learning l
 
 ---
 
-## 2026-05-15 — `(this commit)` — LLM-as-judge reranker (P2 closer #2)
+## 2026-05-15 — `e9c08fe` — LLM-as-judge reranker (P2 closer #2)
 
 **Shipped:**
 - `services/reranker.py` — async, LLM-as-judge over top-N candidates. JSON output mode, temp 0, max 80 tokens. Auto-skips on clear winner (sim gap > 0.10), <2 candidates, or parse failure. Returns `RerankResult` with movement map for /insights drill-down.
@@ -329,7 +329,7 @@ Cases that moved to rank 1: `personal-relationship-japane` ("kenojo") was rank 5
 
 ---
 
-## 2026-05-15 — `(this commit)` — graph UI: search, hover details, clusters
+## 2026-05-15 — `6632d3f` — graph UI: search, hover details, clusters
 
 **Shipped:**
 - `NodeSearch` component — floating top-left search input. Live substring filter on titles, ↑/↓/Enter/Esc keyboard nav, "/" anywhere on the page focuses it. Picking a match selects the node AND flies the camera to it (~700ms ease).
@@ -348,7 +348,7 @@ Cases that moved to rank 1: `personal-relationship-japane` ("kenojo") was rank 5
 
 ---
 
-## 2026-05-15 — `(this commit)` — agentic topic clustering + Phase 1 scaling
+## 2026-05-15 — `6632d3f` — agentic topic clustering + Phase 1 scaling
 
 **Shipped:**
 - `services/clustering.py` — k-means on node-mean embeddings + per-cluster LLM naming. Two stages, deliberately split: deterministic math for grouping, one LLM call per cluster for the human-readable label. Defensive parsing with "Topic N" fallback.
@@ -373,7 +373,7 @@ Cases that moved to rank 1: `personal-relationship-japane` ("kenojo") was rank 5
 
 ---
 
-## 2026-05-15 — `(this commit)` — URL ingestion cleanup + inline media previews
+## 2026-05-15 — `6632d3f` — URL ingestion cleanup + inline media previews
 
 **Shipped:**
 - `services/chunking.prepare_for_embedding(text)` — strips http(s) URLs from text before chunking. Called from both `/nodes/{id}/embed` and `/ingest`. The visible `nodes.content` keeps the URL (for display + the new MediaPreview); the embedded text doesn't include it.
@@ -397,7 +397,7 @@ Cases that moved to rank 1: `personal-relationship-japane` ("kenojo") was rank 5
 
 ---
 
-## 2026-05-15 — `(this commit)` — P3.1: bare agent loop with read-only tools
+## 2026-05-15 — `b05351f` — P3.1: bare agent loop with read-only tools
 
 **Shipped:**
 - `services/tools.py` (new) — OpenAI tool schemas + pure-function dispatch for `search_memory`, `read_node`, `list_clusters`, `read_cluster_members`. All read-only; write tools deferred to P3.3. Result size caps everywhere (preview chars, list rows) so the LLM context stays bounded.
@@ -415,3 +415,19 @@ Cases that moved to rank 1: `personal-relationship-japane` ("kenojo") was rank 5
 - **Context window grows linearly with tool calls.** Every tool result lands in `messages`. A 5-iteration agent with 4 tool calls per iteration sees ~20 prior tool results plus the system prompt plus history on the final LLM call. Result size caps (240-char previews, 50-row list limits) are load-bearing — not premature optimization.
 - **Adding a tool is two changes.** One schema entry, one dispatch function. No decorators, no registration ceremony. This is what "hand-rolled" buys you: total clarity on what's wired up. Compare to LangChain's `@tool` decorator + retriever class + chain composition.
 - **In-band UUID validation pays for itself in one bug.** Live audit caught the model passing cluster *labels* ("Eijuuu References") where UUIDs were expected — Postgres returned an opaque "22P02 invalid input syntax" error, the agent recovered but burned ~300ms × 3 calls. Added a regex pre-check that returns "expected UUID, got 'Eijuuu References' — call list_clusters() first to get the UUID" instead. Same defensive pattern as the rewriter/reranker — make errors helpful before they reach the model.
+
+---
+
+## 2026-05-16 — `(this commit)` — docs housekeeping pass #3
+
+**Shipped:**
+- README rewrite — status badge bumped to *P1 ✅ · P2 🟢 ~95% · P3 🟡 20%*. "What works today" rewritten with the seven shipped capabilities since pass #2 (rewriter, reranker, clustering, graph UI sweep, media previews, agent mode). A/B examples in the commands section now cover all 5 retrieval flag combos.
+- ARCHITECTURE additions — full data flow for `/agent` (5-iter LLM-tools loop with the in-band-error pattern + iteration-cap fallback), full data flow for `recompute-clusters` (k-means + LLM-naming + members_hash reuse), three new invariants (#15 in-band tool errors, #16 agent input bounds, #17 agent-and-chat-share-substrate).
+- EVALS expanded — A/B section now documents `EVAL_QUERY_REWRITE` and `EVAL_RERANK` flags alongside `EVAL_STRATEGY`. Added the cumulative deltas table showing how each layer (graph-aug → rewriter → reranker) bought a distinct slice of recall/precision. Limitations section acknowledges the agent-quality eval gap.
+- LEARNING grew Part 3.5 — six new concept sections covering query rewriting, LLM-as-judge reranker, agentic clustering (k-means + LLM-naming + members_hash), the agent loop hand-rolled, the agent ↔ retrieval relationship, and the "no LangChain through P3" reaffirmation. Each carries an interview-ready soundbite.
+- PROGRESS placeholder backfill — 6 entries that said `(this commit)` now carry their actual hashes (`28bbd7e`, `e9c08fe`, three at `6632d3f`, `b05351f`).
+
+**What I learned:**
+- **Per-feature ADRs + ROADMAP entries kept the per-decision documentation honest, but the overview docs (README, ARCHITECTURE, LEARNING) drifted because no individual commit "owned" them.** Same lesson as housekeeping pass #2. The fix isn't more discipline; it's accepting that overview docs need a periodic sweep, and scheduling it (every ~5 feature commits, when the README status badge becomes a lie).
+- **The "shipped + learned" template scales.** Looking back at the PROGRESS log, every entry follows the same shape: bullets of shipped pieces, bullets of lessons. Future-me reading this five months from now gets both *what's there* and *what to remember about why* in one pass. Worth keeping the template strict.
+- **Update the LEARNING soundbites alongside the code, not after.** A soundbite written cold months later is a guess at what mattered. Written the same day as the code, it captures the actual reasoning while it's still load-bearing.

@@ -2,7 +2,7 @@
 
 A visual AI memory system. Your knowledge as an interconnected graph of nodes — docs, images, URLs, notes — wired together by manual links and semantic similarity. Chat with your memory; the graph organizes itself; agents (P3) will read and extend it.
 
-> **Status:** P1 ✅ shipped · P2 ~ partially shipped (semantic edges, evals, graph-augmented retrieval). See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status:** P1 ✅ · P2 🟢 ~95% (rewriter, reranker, clustering, graph UI sweep, media previews) · P3 🟡 20% (P3.1 agent loop shipped). See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What works today
 
@@ -14,10 +14,16 @@ A visual AI memory system. Your knowledge as an interconnected graph of nodes �
 - **Multi-turn conversation memory** — last 6 messages of each chat session sent as history; pronouns and follow-ups ("what about her age?") resolve naturally.
 - **Auto-connect v2.1** — single SQL function does best-pair-chunk similarity (max over chunk-pair Cartesian) + kNN per node (top-3) + min-weight floor (0.25). No threshold tuning, no orphan nodes, no false-friend noise. Chain runs automatically after every save.
 - **Graph-augmented retrieval** — `/chat` uses `match_chunks_with_neighbors`: vector top-k + 1-hop graph expansion in one DB round-trip. Measured: at stress test, recall@5 lifts 75% → 100%.
-- **Edge weight visualization** — discrete color tiers (slate/cyan/amber by similarity), legend in canvas corner, edge width + particle density modulated by weight. Force simulation tuned for spaced layout.
-- **Unified add-memory flow** — single "+ Add memory ▸" button → dropdown → type-aware draft form rendered inside the sidebar. Save chains: persist → embed → auto-connect → refresh edges. Zero manual clicks.
-- **Eval harness** — `make evals` runs a JSON golden set against the production retrieval path, reports recall@1/3/5/10 + MRR, supports A/B comparison via `EVAL_STRATEGY` env var.
-- **AI observability dashboard** — `/insights` page shows aggregate cost/latency/empty-context-rate, per-stage timing breakdown, recent-request list with drill-down to the raw prompt sent to OpenAI for any chat turn. Powered by a `chat_logs` table that records every turn (RLS-scoped per workspace).
+- **LLM query rewriting (multi-turn)** — before embedding, gpt-4o-mini rewrites pronoun-laden follow-ups ("how old is she?") into standalone search queries ("how old is Eijuuu?") using the last 4 turns. Skipped on single-turn (zero added cost). Measured: recall@1 +5pp, MRR +0.025.
+- **LLM-as-judge reranker** — over-fetches 2× from retrieval, sends top-N candidates + question to gpt-4o-mini for reordering, takes top-K. Auto-skips on clear winner. Measured: recall@1 80→**95.24%**, MRR 0.885→**0.976** with rewriter+rerank stacked.
+- **Agentic topic clustering** — `🏷 Recompute topics` runs sklearn MiniBatchKMeans on node-mean embeddings + per-cluster gpt-4o-mini labeling. Phase 1 scaling: members-hash reuse skips the LLM call when a cluster's membership is unchanged. Color-coded clusters in the 3D canvas, clickable legend with focus-others-dim.
+- **Edge weight visualization** — discrete color tiers (slate/cyan/amber by similarity), legend in canvas corner, edge width + particle density modulated by weight.
+- **Unified add-memory flow** — single "+ Add memory ▸" button → dropdown → type-aware draft form rendered inside the sidebar. Save chains: persist → embed → auto-connect → refresh edges.
+- **Graph UI sweep** — substring node search top-left with `/` shortcut + camera fly-to · richer hover tooltips (node content preview, edge weight + endpoints) · cluster legend with focus interaction.
+- **Inline media previews in sidebar** — YouTube/Vimeo iframe embeds, inline PDF viewer (signed-URL Storage objects), image preview, generic-URL link card. URL ingestion strips URLs from embedded text so the embedder sees only the prose signal.
+- **🤖 Agent mode (P3.1)** — `POST /agent` runs a multi-step LLM-tools loop. Read-only tools today: `search_memory`, `read_node`, `list_clusters`, `read_cluster_members`. Hand-written agent loop, ~200 lines, no framework. Live SSE trace shows each tool call as a collapsible row in the chat panel. Self-heals from in-band errors (validated live: agent recovered from passing labels-as-UUIDs by calling `list_clusters` first).
+- **Eval harness** — `make evals` runs a JSON golden set (21 cases) against the production retrieval path, reports recall@1/3/5/10 + MRR, supports A/B comparison via `EVAL_STRATEGY` / `EVAL_QUERY_REWRITE` / `EVAL_RERANK` env vars.
+- **AI observability dashboard** — `/insights` page shows aggregate cost/latency/empty-context-rate, per-stage timing breakdown, recent-request list with drill-down to the raw prompt sent to OpenAI for any chat turn. Records both `/chat` and `/agent` rows (full tool-call trace as jsonb on agent rows).
 - **In-chat raw-prompt panel** — every assistant message has a "▶ view raw prompt" expander showing the exact messages array sent to the LLM. Token counts + $ cost rendered inline.
 
 ## Stack
@@ -84,11 +90,22 @@ make evals      # run retrieval evals (recall@k + MRR over golden set)
 make help       # full list
 ```
 
-A/B retrieval comparison:
+A/B retrieval comparison (the same `make evals` harness, different env knobs):
 ```bash
-EVAL_STRATEGY=match_chunks make evals                     # baseline
-EVAL_STRATEGY=match_chunks_with_neighbors make evals      # graph-augmented
-EVAL_K_MAX=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals  # stress test
+# Baseline — vector only.
+EVAL_STRATEGY=match_chunks make evals
+
+# Graph-augmented — vector + 1-hop neighbor expansion.
+EVAL_STRATEGY=match_chunks_with_neighbors make evals
+
+# Stress: only top-1 chunk allowed. Shows graph-aug's recall lift starkly.
+EVAL_K_MAX=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals
+
+# + LLM query rewriting on multi-turn cases (those with `history` in golden.json).
+EVAL_QUERY_REWRITE=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals
+
+# Full stack — query rewriting + LLM-as-judge reranker (current best: recall@1 95%, MRR 0.976).
+EVAL_QUERY_REWRITE=1 EVAL_RERANK=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals
 ```
 
 ## Project layout

@@ -83,7 +83,7 @@ This is the discipline that distinguishes RAG engineering from RAG vibes.
 
 ## Switching retrieval strategies (A/B comparison)
 
-The script supports two retrieval functions via an env var:
+Every retrieval-touching feature added an env flag. Same script, same golden set, one flag changed at a time. Numbers go in the commit message.
 
 ```bash
 # Baseline: pure vector search (default)
@@ -91,34 +91,60 @@ make evals
 
 # Graph-augmented: vector search + 1-hop neighborhood expansion
 EVAL_STRATEGY=match_chunks_with_neighbors make evals
+
+# + LLM query rewriting on cases that carry a `history` field in golden.json
+EVAL_QUERY_REWRITE=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals
+
+# + LLM-as-judge reranker (over-fetch 2× from retrieval, re-order top-N → top-K)
+EVAL_RERANK=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals
+
+# Full stack — current best
+EVAL_QUERY_REWRITE=1 EVAL_RERANK=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals
+
+# Stress test: only top-1 chunk allowed. Reveals graph-aug's recall lift starkly.
+EVAL_K_MAX=1 EVAL_STRATEGY=match_chunks_with_neighbors make evals
 ```
 
-This lets you measure the impact of any retrieval change against the same golden set. Workflow:
+This lets you measure any retrieval change against the same golden set. Workflow:
 
 1. Run baseline → write down numbers.
-2. Change retrieval (new strategy / new SQL / new threshold).
+2. Change retrieval (new strategy / new SQL / new threshold / new flag).
 3. Run with the new strategy → compare numbers.
 4. Keep or revert based on what the metrics say.
 
-The eval script header tells you which strategy is in effect:
+### Measured deltas (21-case golden set)
+
+The cumulative story we shipped through P2:
+
+| Configuration | recall@1 | recall@3 | recall@5 | MRR |
+|---|---|---|---|---|
+| `match_chunks` (vector only, baseline) | ~75% | ~90% | ~95% | ~0.83 |
+| `match_chunks_with_neighbors` (graph-aug) | 80% | 95% | 100% | 0.885 |
+| `+ EVAL_QUERY_REWRITE=1` (rewriter on multi-turn) | 85% | 95% | 100% | 0.910 |
+| `+ EVAL_RERANK=1` (rerank on top of rewriter) | **95.24%** | **100%** | 100% | **0.976** |
+
+Graph-aug bought us recall (right chunk shows up *somewhere*). Rewriter bought us recall on multi-turn pronouns (right chunk for follow-up questions). Reranker bought us precision (right chunk lands at *position 1*). Each layer addressed a distinct failure mode — measured, not guessed.
+
+The eval script header tells you what's in effect:
 
 ```
 == Mem Palace retrieval evals ==
-   8 cases · k_max=10 · model=text-embedding-3-small · strategy=match_chunks_with_neighbors (neighbor_count=1)
+   21 cases · k_max=10 · model=text-embedding-3-small · strategy=match_chunks_with_neighbors (neighbor_count=1) · query_rewrite=ON · rerank=ON (chat_model=gpt-4o-mini)
 ```
 
 ---
 
 ## Limitations and what's next
 
-P1 evals measure **retrieval recall only**. They do *not* measure:
+These evals measure **retrieval recall only**. They do *not* measure:
 
-- **Faithfulness** — does the answer actually use the retrieved context, or hallucinate? (P3: LLM-as-judge.)
-- **Answer quality** — does the answer correctly use the chunk? (P3: LLM-as-judge.)
-- **Latency under load** — single-shot timings only. (P4 if needed.)
-- **Cross-tenant isolation** — eval uses service role and ignores RLS. (Add focused RLS tests in P2 if we touch the security layer.)
+- **Faithfulness** — does the answer actually use the retrieved context, or hallucinate? Visible in `/insights` per-row, not yet automated. (P4: LLM-as-judge over answer + context.)
+- **Answer quality** — does the answer correctly use the chunk? Same path: P4 LLM-as-judge.
+- **Agent path quality** — `/agent` (P3.1) makes multiple retrievals per question; `make evals` only measures single-shot recall. The agent's *tool calls* use the same retrieval primitives we measure here, so retrieval improvements propagate; what we don't yet measure is whether the agent *picks the right tools in the right order*.
+- **Latency under load** — single-shot timings only.
+- **Cross-tenant isolation** — eval uses service role and ignores RLS. (Add focused RLS tests if we touch the security layer.)
 
-Each metric is a future line item — but recall@k + MRR is the foundation, and you should add it before *any* retrieval optimization.
+Each is a future line item — but recall@k + MRR is the foundation, and we add a measurement *before* any retrieval optimization.
 
 ## Reading the failure list
 

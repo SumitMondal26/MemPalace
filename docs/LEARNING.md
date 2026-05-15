@@ -301,6 +301,127 @@ similarity(A, B) = MAX over (chunk_a in A, chunk_b in B) of cosine(chunk_a, chun
 
 ---
 
+# Part 3.5 — Late-P2 + P3.1 Concepts (added 2026-05-16)
+
+The retrieval stack grew three new layers and an entirely new endpoint. Each one fixes a distinct failure mode the layers below couldn't.
+
+## 3.5.1 Query rewriting (the multi-turn fix)
+
+**The problem.** Multi-turn chat sends prior messages to the LLM at *generation* time, but the *retrieval* step embeds only the latest message. So `"how old is she?"` retrieves whatever is geometrically nearby — often the wrong age node — because the embedder has no signal that "she" refers to a specific entity from the previous turn.
+
+**The fix.** Before embedding, one cheap LLM call (gpt-4o-mini, JSON mode, temp 0, max 120 tokens) takes the latest question + last 4 turns and rewrites the question into a standalone search query: `"how old is Eijuuu?"`. The embedder sees *that*. The user-visible question still goes into the prompt verbatim — the rewriter only steers retrieval, not generation.
+
+**Why split retrieval input from generator input.** Two separate concerns. If the rewriter is wrong (subtle paraphrase), the LLM still answers the user's literal words. The rewriter is plumbing for the embedder, not a translator for the user.
+
+**Defensive design.** Three failure modes (parse error, API timeout, junk JSON) all share one fallback: return the original question. Rewriter never blocks `/chat`.
+
+**Measured.** Recall@1 80→85%, MRR 0.885→0.910. Two cases flipped to rank 1 (vague-partner, vague-her-age). Skipped on single-turn (no history to rewrite from).
+
+**Soundbite.** *"Multi-turn chat had asymmetric context — generator could see history, retriever was blind to it. Fixed with one LLM call between user input and embed_query that rewrites pronouns into entity names. Defensive: any failure falls back to the original question. Measured +5pp recall@1 / +0.025 MRR. Skipped on single-turn — zero added cost on the dominant case."*
+
+## 3.5.2 LLM-as-judge reranker (the precision fix)
+
+**The problem.** Vector retrieval is *recall-optimized*. Top-k chunks are ranked by cosine similarity, computed independently. Two chunks with similarity 0.45 vs 0.44 are essentially tied — the embedder has no way to know which actually answers the question. The LLM then gets two near-tied chunks in the prompt and may cite the wrong one (caught live in /insights: "how old is he?" returned `[1] sumit's age @ 0.45` and `[2] eijjuu's age @ 0.44`, model picked [2]).
+
+**The fix.** Over-fetch 2× from retrieval, send top-N (max 8) candidates + question to gpt-4o-mini in JSON mode, get back ranked indices, reorder, take top-K. The judge sees ALL candidates AND the question together — it can read both chunks and reason about which one matches.
+
+**Auto-skip when the work is unnecessary.** If the top candidate's similarity is more than 0.10 above the second, skip the LLM call entirely. The cost guard preserves the cheap-when-easy property.
+
+**Why LLM-as-judge over a cross-encoder.** Cross-encoders are faster (~50ms) and free per call after the model download (~400MB), but they need a Python ML dep + model weights in the API container. LLM-as-judge ships in zero infra changes for ~$0.0001/turn. Easy to swap to a cross-encoder later if cost or latency demand it.
+
+**Measured.** Recall@1 85.7→**95.24%** (+9.5pp), MRR 0.914→**0.976**. Three cases flipped to rank 1 (kenojo from rank 5!). Largest single-PR retrieval lift in the project's history.
+
+**Why over-fetch matters.** Without `fetch_k = body.k * 2`, the reranker would just be reordering the same 5 chunks vector retrieval was going to send. The win comes from candidates 6-10 — chunks the reranker can promote from "not in top-K" to "actually the answer".
+
+**Soundbite.** *"Recall and precision are different problems. Vector retrieval optimizes recall; near-tied candidates need a precision step. Built an LLM-as-judge reranker that over-fetches 2x, sends candidates + question to gpt-4o-mini, gets ranked indices back, reorders. Auto-skips when top-1 is clearly above top-2 — cost guard. Measured +9.5pp recall@1, +0.062 MRR. Cross-encoder would be faster but adds an ML dep — LLM-as-judge ships in zero infra."*
+
+## 3.5.3 Agentic topic clustering (k-means + LLM-naming)
+
+**The shape.** Two stages, deliberately split.
+1. **K-means on node-mean embeddings** (sklearn MiniBatchKMeans). Deterministic, math, no LLM. K-selection by silhouette score with sub-sampling for large n.
+2. **LLM naming, one call per cluster** (gpt-4o-mini, JSON mode, max 30 tokens). The model sees member titles, returns a 2-3 word topic label.
+
+**Why split this way.** Letting the LLM do both jobs (group AND label) costs ~10× more and doesn't scale past ~100 nodes (token limit). Letting an algorithm do the math and the LLM do the writing is the clean separation: math gives precision, LLM gives readability. People sometimes call this an "agentic workflow"; honestly it's just well-chosen division of labor.
+
+**Phase 1 scaling: members_hash.** Compute `sha256(sorted(member_ids))` per cluster. Before naming, look up the previous run's `(hash → label)` map; matching hashes reuse the previous label and skip the LLM call. In steady state most clusters between two recompute runs have identical membership — this saves ~$0.0001 × N unchanged clusters per recompute.
+
+**What clustering buys the canvas.** Two new tools the agent can use (`list_clusters`, `read_cluster_members`) to navigate by topic instead of keyword search. Cluster colors in the 3D canvas + clickable legend with focus-others-dim.
+
+**Honest limit.** K-means assigns by embedding *proximity*, not meaning. A "BTS songs" note can land in a Books cluster because both project as "personal preferences" in vector space. The fix isn't more math; it's letting an LLM read the actual content (LLM-as-clusterer, deferred to a future iteration).
+
+**Soundbite.** *"Topic clustering is k-means on node-mean embeddings + per-cluster LLM-naming. Math for grouping, LLM for naming — splitting them costs ~10x less than letting the LLM do both. members_hash fingerprints cluster membership; on re-runs the unchanged clusters skip the LLM call. Phase 1 scaling — sklearn substrate so it scales to ~10k nodes without architectural change."*
+
+## 3.5.4 The agent loop (P3.1)
+
+**The shape, in 30 lines.**
+
+```python
+messages = [system, ...history, user_question]
+for iter in range(MAX_ITERATIONS):                  # cap = 5
+    resp = await openai.chat.completions.create(
+        messages=messages,
+        tools=TOOL_SPECS,
+        tool_choice="auto",
+        max_tokens=800,
+    )
+    msg = resp.choices[0].message
+    if not msg.tool_calls:
+        yield AgentFinalAnswer(msg.content); break
+    messages.append(msg)
+    for call in msg.tool_calls:
+        result = await dispatch_tool(call.name, parsed_args, ctx)
+        yield AgentToolCall(...) ; yield AgentToolResult(...)
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": ...})
+```
+
+That's the heart of every agent framework you've heard of (LangChain, LangGraph, AutoGPT, OpenAI Assistants). Hand-wrote it because the loop is small enough to read in 30 seconds and you'll know what the frameworks are hiding.
+
+**Tools = JSON schemas + dispatch functions.** The schema teaches the LLM what's possible. The dispatch teaches our type checker what's safe. Adding a tool = one schema entry + one async function. No decorators.
+
+**The big mental shift: errors belong in the message history, not the call stack.** A tool dispatch that raises Python exceptions kills the agent. A tool that returns `{ok: false, error: "..."}` and lets the LLM see it on the next iteration lets the agent recover (try different args, give up gracefully, route around). Validated live: the agent self-recovered from passing labels-as-UUIDs by calling `list_clusters` first.
+
+**Streaming + tool calls don't mix easily.** OpenAI streams tool calls but the natural UX is "show the reasoning unfold step by step" — not "stream tokens of the reasoning." The agent path delivers the final answer as one `final` event. /chat still streams tokens for the cheap path. Two surfaces, two budgets.
+
+**Iteration cap behavior matters more than the cap itself.** When we hit `MAX_ITERATIONS=5` without a final answer, we issue ONE more LLM call with `tools=[]` — forces the model to summarize what it found. Honest output ("I couldn't determine X") beats truncation.
+
+**Soundbite.** *"Hand-wrote the agent loop, ~200 lines, no framework. The model sees four read-only tools — search_memory, read_node, list_clusters, read_cluster_members — picks which to call, my server runs them, results go back into the conversation as 'tool' role messages, model decides whether to call more tools or produce the final answer. Up to 5 iterations. The big lesson: tool errors belong in the message history, not the call stack — that's how the agent self-heals from its own mistakes without us hard-coding recovery logic."*
+
+## 3.5.5 The agent ↔ retrieval relationship
+
+**The single most important thing to internalize about agents:** they don't replace RAG, they *use* it.
+
+```
+                    ┌────────────────────────────────────┐
+                    │       AGENT (P3) — the planner      │
+                    │  Decides WHEN, WHAT, HOW MANY       │
+                    └─────────────────┬───────────────────┘
+                                      │ calls
+              ┌───────────────────────┼─────────────────────────┐
+              ▼                       ▼                         ▼
+         search_memory          read_node              list_clusters
+              │                       │                         │
+              ▼                       ▼                         ▼
+    [embeddings + chunking + graph + reranking + clustering — all of P1+P2]
+```
+
+Every retrieval improvement we shipped — chunking strategy, graph 1-hop, reranker, clustering — *makes the agent better*. The agent inherits the quality of its tools.
+
+**Cost shape.** Agent ≈ 7× /chat for ~3× latency on average. Worth it for exploratory questions ("tell me everything about X"). Wasted for focused ones ("what's X?"). Real systems route between them.
+
+**Soundbite.** *"Tools without good retrieval underneath are useless. The agent calls search_memory — that's pgvector + graph expansion + reranking under the hood. Every P1/P2 retrieval improvement makes every agent run shorter, cheaper, more accurate. The agent isn't a substitute for the retrieval pipeline; it's a planner that consumes it."*
+
+## 3.5.6 Why we kept "no LangChain" through P3 (ADR-006 reaffirmed)
+
+LangChain abstracts the agent loop into one method call. That's the *single most valuable thing to understand* in the project for interview purposes. Frameworks abstract exactly the part you want to internalize.
+
+LangChain has had three major rewrites in 18 months — code from a year ago doesn't run today. Hand-rolled code is stable across OpenAI SDK minor bumps.
+
+The decision is reversible per-feature. We may use LangChain (or LangGraph) at P3.5 if web-fetcher integration surface gets painful. Doesn't change the value of having hand-rolled the loop first.
+
+**Soundbite.** *"I deliberately built the agent loop and retrieval pipeline by hand to internalize how they actually work. LangChain abstracts all of that, and at the level I was learning, those abstractions would have hidden the lessons. For a production system on a deadline I'd reach for it; for a portfolio piece designed to teach me AI engineering, hand-rolled was the right call."*
+
+---
+
 # Part 4 — Architecture & flows (still current)
 
 ## 3.1 Why two services

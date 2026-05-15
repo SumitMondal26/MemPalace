@@ -138,6 +138,92 @@ User question + prior 6 messages (history snapshot)
        - total time + token + cost line (done)
 ```
 
+## Data flow: agent (P3.1 — multi-step LLM-tools loop, observed)
+
+```
+User question + prior 6 messages (history snapshot)
+   → POST /agent (SSE response, distinct endpoint from /chat)
+   → resolve workspace_id via supabase_user
+   → build ToolContext{sb_user, openai, workspace_id}
+   → loop iter in [0..MAX_ITERATIONS=5):
+       → openai.chat.completions.create(messages, tools=TOOL_SPECS,
+                                         tool_choice="auto",
+                                         max_tokens=800,
+                                         temperature=0.2)
+       → IF response has no tool_calls:
+           → final answer; emit SSE "final" event; break
+       → ELSE:
+           → append assistant msg (with tool_calls intact) to messages
+           → for each tool_call:
+               - parse json arguments (defensive — empty dict on parse error)
+               - emit SSE "tool_call" {iter, name, args, tool_call_id}
+               - dispatch_tool(name, args, ctx)
+                   * UUID-validate id-taking params first; helpful error
+                     in-band rather than letting Postgres 22P02 leak through
+                   * try/except — exceptions become {ok:false, error:str},
+                     visible to the LLM next iteration (in-band recovery)
+               - emit SSE "tool_result" {iter, name, ok, result_preview, ms}
+               - append {role:tool, tool_call_id, content: json(result)}
+                 to messages (CAPPED to 4000 chars to bound context growth)
+   → IF iter cap hit (no final answer yet):
+       → ONE more LLM call with tools=[]  ← forces the model to summarize
+                                            what it has rather than loop
+   → emit SSE "done" {iterations, hit_iter_cap, prompt_tokens,
+                       completion_tokens, cost_usd, elapsed_ms}
+   → INSERT chat_logs row with is_agent=true, agent_iterations,
+     agent_tool_calls (jsonb), agent_hit_iter_cap (try/except)
+   → ChatPanel reads frames, dispatches:
+       - AgentTrace rows (tool_call + tool_result, collapsible)
+       - violet/amber chip ("agent · N iterations" / "hit cap")
+       - bubble content (final)
+       - total time + token + cost (done)
+```
+
+Tools available to the model (read-only in P3.1):
+
+| Tool | Wraps | Returns |
+|---|---|---|
+| `search_memory(query, k)` | `embed_query` + `match_chunks_with_neighbors` | top-k chunks: {node_id, node_title, similarity, source, preview} |
+| `read_node(node_id)` | nodes table by UUID + cluster join | {id, title, type, content (capped 2k chars), cluster_label} |
+| `list_clusters()` | clusters + nodes count via IN-query | [{cluster_id, label, member_count}, ...] |
+| `read_cluster_members(cluster_id)` | nodes filtered by cluster_id (capped 50 rows) | [{node_id, title, type}, ...] |
+
+Write tools (`create_summary_node`, `link_nodes`) are deferred to P3.3 — the audit/confirmation/undo story is heavier than P3.1's read-only scope.
+
+## Data flow: agentic topic clustering (Recompute topics)
+
+```
+Click "🏷 Recompute topics" in canvas controls
+   → POST /workspaces/{id}/recompute-clusters
+   → SQL: workspace_node_embeddings(ws_id)
+       - returns (node_id, AVG(chunk.embedding)::vector(1536)) per node
+   → SQL: nodes(id,title) — for the LLM-naming step
+   → SQL: clusters(members_hash, label) — prior run's hash → label map
+   → services.clustering.cluster_workspace(...):
+       - sklearn MiniBatchKMeans, K-selection by silhouette_score with
+         sample_size cap (sub-quadratic for large n)
+       - n_init=10 random restarts, keeps best by inertia
+       - K bounded to min(MAX_K_ABS=12, n // 3)
+       - For each cluster:
+           members_hash = sha256(sorted(member_ids))
+           IF prior_label_by_hash.get(members_hash):
+               reuse the previous label (skip LLM call)
+           ELSE:
+               gpt-4o-mini call with member titles, JSON mode,
+               max 30 tokens; "Topic N" fallback on parse failure
+   → DELETE clusters WHERE workspace_id=ws_id
+       (cascades nodes.cluster_id → NULL via FK)
+   → INSERT new clusters with members_hash + label
+   → UPDATE nodes.cluster_id by member list (one IN-query per cluster)
+   → response: {clusters_created, k_chosen, silhouette,
+                naming_calls, naming_skipped, cost_usd}
+   → frontend refetches nodes + clusters (applyClusters store action)
+   → GraphCanvas prefers DB clusters over connected-components fallback
+   → Cluster legend renders with real labels; click any row to focus
+```
+
+ADR-019 captures the scaling story (Phase 1 substrate: sklearn + members-hash; Phase 2-3 tiered architecture deferred).
+
 ## Data flow: semantic edges (auto-connect)
 
 ```
@@ -239,6 +325,9 @@ These should never break. If you change code that touches one, update this doc.
 12. **Rewriter never blocks the chat path.** All failures (parse error, API timeout, junk JSON) silently fall back to the original question. The rewrite must be defensive — a broken rewriter = degraded retrieval, not a broken `/chat`.
 13. **Reranker never blocks the chat path either.** Same defensive pattern as the rewriter — every failure (parse error, missing/wrong indices, API error) returns the original ordering. A broken reranker degrades to "no rerank," not to "no chat."
 14. **Reranking only fires on ambiguity.** When the top vector candidate's similarity is more than 0.10 above the second, we skip the rerank call. The cost guard preserves the cheap-when-easy property of the pipeline — reranking is paid only when it can actually help.
+15. **Tool errors land in the message history, not the call stack.** A tool dispatch that raises Python exceptions becomes `{ok: false, error: ...}` in a `tool` role message — visible to the LLM next iteration. The agent can recover (try different args, give up gracefully, route around). Validated live: agent self-recovered from passing labels-as-UUIDs by calling `list_clusters` first.
+16. **Agent input bounded at every layer.** Iteration cap (5), per-turn `max_tokens` (800), per-tool result preview cap (240 chars), per-tool list-row cap (50), tool result content cap into messages (4000 chars). Each cap individually deferrable; together they keep a runaway agent from burning a workspace's monthly budget on one question.
+17. **Agent and chat are separate paths, same substrate.** `/agent` calls the same `embed_query` + `match_chunks_with_neighbors` + clusters tables that `/chat` does. Tools are the *interface*; retrieval is the *implementation*. Improving retrieval improves both paths simultaneously.
 
 ## Open architectural questions (deferred)
 
