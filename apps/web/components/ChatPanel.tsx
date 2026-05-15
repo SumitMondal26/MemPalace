@@ -48,7 +48,9 @@ type DoneInfo = {
 
 /** One agent step: either a tool call or its result. The trace UI renders
  *  them as a collapsible row each; pairing a `tool_call` with its
- *  `tool_result` happens via tool_call_id. */
+ *  `tool_result` happens via tool_call_id.
+ *  `attempt` distinguishes the first agent pass from the post-reflection
+ *  retry pass so the UI can visually separate them. */
 type AgentStep =
   | {
       kind: "tool_call";
@@ -57,6 +59,7 @@ type AgentStep =
       args: Record<string, unknown>;
       tool_call_id: string;
       elapsed_ms: number;
+      attempt?: "first" | "retry";
     }
   | {
       kind: "tool_result";
@@ -67,7 +70,26 @@ type AgentStep =
       result_preview: string;
       tool_ms: number;
       elapsed_ms: number;
+      attempt?: "first" | "retry";
     };
+
+type ReflectionInfo = {
+  /** Score of the SHIPPED answer (max of first/retry when retry happened). */
+  score: number;        // 1-5
+  /** Score of the first attempt — set on both reflection events so the
+   *  UI can show "originally X, retried, now Y". */
+  score_first?: number;
+  /** Judge's issues on the attempt this event describes. */
+  issues: string;
+  /** True only on the first event when score_first < threshold AND retry
+   *  is about to fire. The second reflection event always has retrying=false. */
+  retrying: boolean;
+  /** "first" (implicit, omitted) or "retry" — which attempt this judge call
+   *  scored. Two reflection events fire when retry happens; the second one
+   *  describes the retry's quality. */
+  attempt?: "first" | "retry";
+  elapsed_ms: number;
+};
 
 type Message = {
   role: "user" | "assistant";
@@ -83,6 +105,16 @@ type Message = {
   agentSteps?: AgentStep[];
   agentIterations?: number;
   agentHitIterCap?: boolean;
+  /** First judge call's result. Always set on agent runs with reflection on. */
+  reflection?: ReflectionInfo;
+  /** Second judge call's result (only when retry happened). When present,
+   *  the chip shows the *shipped* answer's score by picking the higher one. */
+  reflectionRetry?: ReflectionInfo;
+  reflectionRetried?: boolean;
+  /** Set when the retry's answer scored worse than the first — the bubble
+   *  shows the first answer instead. Lets the trace UI explain why the
+   *  visible answer doesn't match the last `final` event in time order. */
+  shippedFirstAnswer?: boolean;
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -212,6 +244,25 @@ export default function ChatPanel() {
     }));
   }
 
+  function setReflection(reflection: ReflectionInfo) {
+    // Route by attempt tag — the server emits the first judge with no
+    // attempt (or "first"), the second judge with attempt="retry".
+    mutateLastAssistant((m) => {
+      if (reflection.attempt === "retry") {
+        return { ...m, reflectionRetry: reflection };
+      }
+      return { ...m, reflection };
+    });
+  }
+
+  function setReflectionRetried(retried: boolean) {
+    mutateLastAssistant((m) => ({ ...m, reflectionRetried: retried }));
+  }
+
+  function markShippedFirst() {
+    mutateLastAssistant((m) => ({ ...m, shippedFirstAnswer: true }));
+  }
+
   function markDone(done: DoneInfo) {
     mutateLastAssistant((m) => ({ ...m, done }));
   }
@@ -269,14 +320,31 @@ export default function ChatPanel() {
       pushAgentStep({ kind: "tool_result", ...(payload as Omit<Extract<AgentStep, { kind: "tool_result" }>, "kind">) });
     } else if (event === "final" && payload && typeof payload === "object") {
       // Agent path delivers the final answer as one event (no token stream).
-      const p = payload as { content: string; iter_used: number };
+      // - first attempt: sets the answer.
+      // - retry: overwrites the answer.
+      // - first-restored: the second judge rejected the retry; we put the
+      //   first attempt's answer back into the bubble.
+      const p = payload as { content: string; iter_used: number; attempt?: string };
       mutateLastAssistant((m) => ({ ...m, content: p.content }));
-      setAgentMeta(p.iter_used, false);
+      if (p.attempt === "first-restored") {
+        markShippedFirst();
+      } else {
+        setAgentMeta(p.iter_used, false);
+      }
+    } else if (event === "reflection" && payload && typeof payload === "object") {
+      setReflection(payload as ReflectionInfo);
     } else if (event === "done" && payload && typeof payload === "object") {
-      const p = payload as DoneInfo & { iterations?: number; hit_iter_cap?: boolean };
+      const p = payload as DoneInfo & {
+        iterations?: number;
+        hit_iter_cap?: boolean;
+        reflection_retried?: boolean;
+      };
       markDone(p);
       if (typeof p.iterations === "number") {
         setAgentMeta(p.iterations, !!p.hit_iter_cap);
+      }
+      if (typeof p.reflection_retried === "boolean") {
+        setReflectionRetried(p.reflection_retried);
       }
     }
   }
@@ -437,14 +505,23 @@ function AssistantTurn({
               ? "bg-amber-950/40 text-amber-200 ring-1 ring-amber-900/60"
               : "bg-violet-950/40 text-violet-200 ring-1 ring-violet-900/60"
           }`}
-          title="Number of LLM-tools loop iterations the agent used"
+          title="Number of LLM-tools loop iterations the agent used (sum across attempts if reflection retried)"
         >
           {message.agentHitIterCap
             ? `agent hit iteration cap (${message.agentIterations})`
             : `agent · ${message.agentIterations} iteration${
                 message.agentIterations === 1 ? "" : "s"
               }`}
+          {message.reflectionRetried && " · retried"}
         </div>
+      )}
+
+      {message.reflection && (
+        <ReflectionChip
+          first={message.reflection}
+          retry={message.reflectionRetry}
+          shippedFirst={message.shippedFirstAnswer}
+        />
       )}
 
       {message.rewrite?.was_rewritten && (
@@ -657,6 +734,16 @@ function Trace({
  */
 function AgentTrace({ steps }: { steps: AgentStep[] }) {
   const [expanded, setExpanded] = useState<string | null>(null);
+  // Insert a visual divider when the attempt switches from "first" to "retry".
+  // Computed once so we can index into it cheaply during the map.
+  const dividerBeforeIdx = (() => {
+    for (let i = 1; i < steps.length; i++) {
+      const prev = steps[i - 1]?.attempt ?? "first";
+      const cur = steps[i]?.attempt ?? "first";
+      if (prev !== cur) return i;
+    }
+    return -1;
+  })();
   return (
     <div className="space-y-1 rounded-lg bg-palace-bg/40 px-2 py-2 text-[11px] ring-1 ring-palace-edge/60">
       <div className="mb-1 text-[9px] font-semibold uppercase tracking-wider text-neutral-500">
@@ -672,6 +759,13 @@ function AgentTrace({ steps }: { steps: AgentStep[] }) {
           : `${s.name} → ${s.ok ? "ok" : "error"} (${s.tool_ms}ms)`;
         return (
           <div key={key}>
+            {i === dividerBeforeIdx && (
+              <div className="my-1 flex items-center gap-2 text-[9px] uppercase tracking-wider text-amber-500/70">
+                <span className="h-px flex-1 bg-amber-900/40" />
+                <span>retry attempt</span>
+                <span className="h-px flex-1 bg-amber-900/40" />
+              </div>
+            )}
             <button
               type="button"
               onClick={() => setExpanded(isExpanded ? null : key)}
@@ -717,4 +811,86 @@ function shortArgs(args: Record<string, unknown>): string {
       return `${k}: ${short}`;
     })
     .join(", ");
+}
+
+function scoreTier(score: number): string {
+  return score >= 5
+    ? "bg-emerald-950/40 text-emerald-200 ring-emerald-900/60"
+    : score >= 4
+      ? "bg-lime-950/40 text-lime-200 ring-lime-900/60"
+      : score >= 3
+        ? "bg-amber-950/40 text-amber-200 ring-amber-900/60"
+        : score >= 2
+          ? "bg-orange-950/40 text-orange-200 ring-orange-900/60"
+          : "bg-red-950/40 text-red-200 ring-red-900/60";
+}
+
+/**
+ * ReflectionChip — surfaces the judge's score on the SHIPPED answer, with
+ * the first-attempt score as expandable detail when retry happened.
+ *
+ *   no retry:               "✓ judge 5/5"
+ *   retry → improvement:    "✓ judge 5/5 (was 2/5, retried)"
+ *   retry → regression:     "⚠ judge 2/5 (retry scored 1/5 — kept first)"
+ *   retry pending mid-stream: "🔄 judge 2/5 — retrying with feedback"
+ */
+function ReflectionChip({
+  first,
+  retry,
+  shippedFirst,
+}: {
+  first: ReflectionInfo;
+  retry?: ReflectionInfo;
+  shippedFirst?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  // Determine the *shipped* score + which issues are relevant.
+  const shipped = retry
+    ? shippedFirst
+      ? first.score
+      : Math.max(first.score, retry.score)
+    : first.score;
+  const issues = retry
+    ? shippedFirst
+      ? retry.issues // why we rejected the retry
+      : first.issues // why we retried in the first place
+    : first.issues;
+  const tier = scoreTier(shipped);
+  const icon = shipped >= 4 ? "✓" : first.retrying && !retry ? "🔄" : "⚠";
+
+  let headline: string;
+  if (retry) {
+    if (shippedFirst) {
+      headline = `judge ${first.score}/5 (retry scored ${retry.score}/5 — kept first)`;
+    } else if (retry.score > first.score) {
+      headline = `judge ${retry.score}/5 (was ${first.score}/5, retried)`;
+    } else {
+      headline = `judge ${retry.score}/5 (tied with first ${first.score}/5)`;
+    }
+  } else if (first.retrying) {
+    headline = `judge ${first.score}/5 — retrying with feedback`;
+  } else {
+    headline = `judge ${first.score}/5`;
+  }
+
+  return (
+    <div className={`rounded-md px-2 py-1 text-[10px] ring-1 ${tier}`}>
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center justify-between"
+        title={`Judged in ${first.elapsed_ms}ms${retry ? ` · retry judged in ${retry.elapsed_ms}ms` : ""}`}
+      >
+        <span>
+          {icon} {headline}
+        </span>
+        {issues && <span className="opacity-60">{expanded ? "▼" : "▶"}</span>}
+      </button>
+      {expanded && issues && (
+        <div className="mt-1 whitespace-pre-wrap text-[10px] opacity-80">
+          {issues}
+        </div>
+      )}
+    </div>
+  );
 }

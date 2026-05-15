@@ -3,21 +3,35 @@
 Differences from /chat:
   - Multi-step: model can call tools (search_memory, read_node, etc.) and
     iterate. /chat does a single retrieval + single LLM call.
-  - SSE protocol additions: `tool_call`, `tool_result`. Same `done`
-    envelope so existing UI bits (cost, latency) work unchanged.
+  - SSE protocol additions: `tool_call`, `tool_result`, `reflection`,
+    `final`. Same `done` envelope so existing UI bits (cost, latency)
+    work unchanged.
   - Final answer is delivered as a single `final` event rather than
     streamed token-by-token. Streaming a tool-using completion adds
     complexity (token interleaving with tool_call events) for marginal
     UX gain on a 5-15s agent run that already has rich progress events.
 
-Same observability path as /chat: writes one `chat_logs` row per turn,
-with `is_agent=true` + `agent_tool_calls` jsonb capturing the full tool
-trace. /insights surfaces both /chat and /agent rows.
+Reflection (P3.2):
+  After the first attempt produces a final answer, an LLM judge scores
+  it 1-5 on grounding + completeness. Score < threshold triggers ONE
+  retry — same agent loop, but the history now contains the rejected
+  answer + the judge's issues as a user-role feedback message. The
+  agent typically does a different sequence of tool calls in response.
+  Cap at 1 retry to prevent ping-pong.
 
-Cost note: a 3-iteration agent uses ~3× the input tokens of /chat
-(message history grows with every tool result). Latency similarly. The
-trade is reasoning depth for resource use — surfaced in the trace so
-the user can see what they're paying for.
+  Every event in attempt 2 is tagged with `attempt: "retry"` so the UI
+  can visually separate the two passes. The `final` event for the
+  retry overwrites the answer bubble; the trace appends.
+
+Same observability path as /chat: writes one `chat_logs` row per turn,
+with `is_agent=true` + `agent_tool_calls` jsonb capturing both attempts'
+tool traces + reflection columns. /insights surfaces both /chat and
+/agent rows.
+
+Cost note: a 3-iteration agent uses ~3× the input tokens of /chat. A
+3-iter agent that triggers retry uses 5-7× (first attempt + judge +
+retry). The judge is ~1 cheap LLM call; the retry is a whole second
+agent run. Surfaced in the trace.
 """
 
 import json
@@ -39,6 +53,7 @@ from ..services.agent import (
     AgentToolResult,
     run_agent,
 )
+from ..services.reflection import build_retry_feedback, reflect_on_answer
 from ..services.tools import ToolContext
 
 router = APIRouter()
@@ -109,78 +124,208 @@ async def agent(
             for m in body.history[-HISTORY_MAX_MESSAGES:]
         ]
 
-        yield _sse("stage", {"label": "Agent reasoning", "elapsed_ms": ms()})
-
-        # Aggregates we'll fill from the AgentDone event at the end.
+        # Cross-attempt accumulators. Tools log carries an "attempt" tag so
+        # /insights replay shows which pass each call belongs to.
+        first_answer = ""
         final_answer = ""
-        iterations = 0
+        iterations_total = 0
         hit_cap = False
-        prompt_tokens = 0
-        completion_tokens = 0
+        prompt_tokens_total = 0
+        completion_tokens_total = 0
         tool_call_log: list[dict] = []
+
+        # Reflection state — None when the judge didn't run (feature off /
+        # no first-attempt answer).
+        # `score_first` = judge's score of attempt 1 (set when reflection ran).
+        # `score`        = SHIPPED answer's score (max of attempts when retried).
+        # `issues`       = judge's issues on the REJECTED attempt — what
+        #                  prompted the retry. Empty when no retry.
+        reflection_score: int | None = None
+        reflection_score_first: int | None = None
+        reflection_issues: str = ""
+        reflection_retried = False
+
+        async def _stream_attempt(
+            attempt_question: str,
+            attempt_history: list[dict],
+            attempt_label: str,
+        ):
+            """Run one full agent pass, yielding SSE events. Updates the
+            outer accumulators via nonlocal — async generators can't return
+            values cleanly, so closures over mutable state is the cleanest
+            way to thread results back to the caller."""
+            nonlocal first_answer, final_answer
+            nonlocal iterations_total, hit_cap
+            nonlocal prompt_tokens_total, completion_tokens_total
+            nonlocal tool_call_log
+
+            async for evt in run_agent(
+                openai, ctx, attempt_question, attempt_history
+            ):
+                if isinstance(evt, AgentToolCall):
+                    yield _sse(
+                        "tool_call",
+                        {
+                            "iter": evt.iter,
+                            "name": evt.name,
+                            "args": evt.args,
+                            "tool_call_id": evt.tool_call_id,
+                            "attempt": attempt_label,
+                            "elapsed_ms": ms(),
+                        },
+                    )
+                elif isinstance(evt, AgentToolResult):
+                    yield _sse(
+                        "tool_result",
+                        {
+                            "iter": evt.iter,
+                            "name": evt.name,
+                            "tool_call_id": evt.tool_call_id,
+                            "ok": evt.ok,
+                            "result_preview": evt.result_preview,
+                            "tool_ms": evt.elapsed_ms,
+                            "attempt": attempt_label,
+                            "elapsed_ms": ms(),
+                        },
+                    )
+                elif isinstance(evt, AgentFinalAnswer):
+                    final_answer = evt.content
+                    if attempt_label == "first":
+                        first_answer = evt.content
+                    yield _sse(
+                        "final",
+                        {
+                            "content": evt.content,
+                            "iter_used": evt.iter_used,
+                            "attempt": attempt_label,
+                        },
+                    )
+                elif isinstance(evt, AgentDone):
+                    iterations_total += evt.iterations
+                    if evt.hit_iter_cap:
+                        hit_cap = True
+                    prompt_tokens_total += evt.prompt_tokens
+                    completion_tokens_total += evt.completion_tokens
+                    for entry in evt.tool_calls:
+                        entry["attempt"] = attempt_label
+                        tool_call_log.append(entry)
+
+        # --- First attempt ---
+        yield _sse("stage", {"label": "Agent reasoning", "elapsed_ms": ms()})
+        async for evt in _stream_attempt(body.question, history, "first"):
+            yield evt
+
+        # --- Reflection + maybe retry ---
+        if settings.reflection_enabled and first_answer:
+            yield _sse(
+                "stage",
+                {"label": "Judging answer quality", "elapsed_ms": ms()},
+            )
+            judgment_first = await reflect_on_answer(
+                openai, body.question, first_answer, tool_call_log
+            )
+            reflection_score_first = judgment_first.score
+            # Provisional: shipped score = first score (updated after retry if any).
+            reflection_score = judgment_first.score
+            reflection_issues = judgment_first.issues
+            prompt_tokens_total += judgment_first.prompt_tokens
+            completion_tokens_total += judgment_first.completion_tokens
+
+            yield _sse(
+                "reflection",
+                {
+                    "score": judgment_first.score,
+                    "score_first": judgment_first.score,
+                    "issues": judgment_first.issues,
+                    "retrying": judgment_first.should_retry,
+                    "elapsed_ms": ms(),
+                },
+            )
+
+            if judgment_first.should_retry:
+                reflection_retried = True
+                # Synthetic history for attempt 2: prior turns + the
+                # question + the rejected answer + the judge's feedback.
+                retry_history = history + [
+                    {"role": "user", "content": body.question},
+                    {"role": "assistant", "content": first_answer},
+                ]
+                feedback_question = build_retry_feedback(first_answer, judgment_first)
+                yield _sse(
+                    "stage",
+                    {"label": "Retrying with feedback", "elapsed_ms": ms()},
+                )
+                async for evt in _stream_attempt(
+                    feedback_question, retry_history, "retry"
+                ):
+                    yield evt
+                # `final_answer` is now the retry's answer. Judge it too.
+                retry_answer = final_answer
+                # Tool log for the retry alone — pass to the judge so it
+                # can verify the retry's grounding against just its own
+                # fresh tool calls.
+                retry_tool_log = [
+                    t for t in tool_call_log if t.get("attempt") == "retry"
+                ]
+                yield _sse(
+                    "stage",
+                    {"label": "Judging retry quality", "elapsed_ms": ms()},
+                )
+                judgment_retry = await reflect_on_answer(
+                    openai, body.question, retry_answer, retry_tool_log
+                )
+                prompt_tokens_total += judgment_retry.prompt_tokens
+                completion_tokens_total += judgment_retry.completion_tokens
+
+                # Ship the better-scoring attempt. Tie → prefer retry
+                # (it had the feedback context, more likely to be better).
+                if judgment_retry.score >= judgment_first.score:
+                    reflection_score = judgment_retry.score
+                    # Keep `reflection_issues` as the FIRST attempt's issues
+                    # (what prompted the retry). The retry's issues, if any,
+                    # are surfaced via the second `reflection` event below.
+                else:
+                    # First attempt won. Restore final_answer + re-emit
+                    # the `final` event so the UI shows the right answer
+                    # (the bubble currently shows the rejected retry).
+                    final_answer = first_answer
+                    yield _sse(
+                        "final",
+                        {
+                            "content": first_answer,
+                            "iter_used": 0,
+                            "attempt": "first-restored",
+                        },
+                    )
+
+                yield _sse(
+                    "reflection",
+                    {
+                        # Second judgment refers to the RETRY's answer.
+                        "score": judgment_retry.score,
+                        "score_first": judgment_first.score,
+                        "issues": judgment_retry.issues,
+                        "retrying": False,  # no further retry
+                        "attempt": "retry",
+                        "elapsed_ms": ms(),
+                    },
+                )
+
+        # --- Done ---
         cited_node_ids: set[str] = set()
-
-        async for evt in run_agent(openai, ctx, body.question, history):
-            if isinstance(evt, AgentToolCall):
-                yield _sse(
-                    "tool_call",
-                    {
-                        "iter": evt.iter,
-                        "name": evt.name,
-                        "args": evt.args,
-                        "tool_call_id": evt.tool_call_id,
-                        "elapsed_ms": ms(),
-                    },
-                )
-            elif isinstance(evt, AgentToolResult):
-                yield _sse(
-                    "tool_result",
-                    {
-                        "iter": evt.iter,
-                        "name": evt.name,
-                        "tool_call_id": evt.tool_call_id,
-                        "ok": evt.ok,
-                        "result_preview": evt.result_preview,
-                        "tool_ms": evt.elapsed_ms,
-                        "elapsed_ms": ms(),
-                    },
-                )
-                # Try to extract cited node ids for the chat_logs row.
-                # Robust to malformed previews — best-effort.
-                try:
-                    if evt.name == "search_memory" and evt.ok:
-                        # The full results aren't in the preview; we'd have to
-                        # plumb them back. For v1 we'll let the agent's
-                        # answer text serve as the citation source and skip
-                        # auto-extraction.
-                        pass
-                except Exception:
-                    pass
-            elif isinstance(evt, AgentFinalAnswer):
-                final_answer = evt.content
-                yield _sse(
-                    "final",
-                    {"content": evt.content, "iter_used": evt.iter_used},
-                )
-            elif isinstance(evt, AgentDone):
-                iterations = evt.iterations
-                hit_cap = evt.hit_iter_cap
-                prompt_tokens = evt.prompt_tokens
-                completion_tokens = evt.completion_tokens
-                tool_call_log = evt.tool_calls
-
-        total_ms = ms()
-        cost_usd = _cost(
-            settings.openai_chat_model, prompt_tokens, completion_tokens
-        )
-
-        # Build the cited_node_ids set from tool_call_log post-hoc so it
-        # appears in chat_logs alongside /chat rows.
         for entry in tool_call_log:
             if entry.get("name") == "read_node":
                 nid = (entry.get("args") or {}).get("node_id")
                 if nid:
                     cited_node_ids.add(nid)
+
+        iterations = iterations_total
+        prompt_tokens = prompt_tokens_total
+        completion_tokens = completion_tokens_total
+        total_ms = ms()
+        cost_usd = _cost(
+            settings.openai_chat_model, prompt_tokens, completion_tokens
+        )
 
         yield _sse(
             "done",
@@ -190,6 +335,9 @@ async def agent(
                 "hit_iter_cap": hit_cap,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "reflection_score": reflection_score,
+                "reflection_score_first": reflection_score_first,
+                "reflection_retried": reflection_retried,
                 "cost_usd": round(cost_usd, 6),
             },
         )
@@ -221,6 +369,10 @@ async def agent(
             "agent_iterations": iterations,
             "agent_tool_calls": tool_call_log,
             "agent_hit_iter_cap": hit_cap,
+            "reflection_score": reflection_score,
+            "reflection_score_first": reflection_score_first,
+            "reflection_retried": reflection_retried,
+            "reflection_issues": reflection_issues or None,
         }
         try:
             sb_user.table("chat_logs").insert(log_row).execute()

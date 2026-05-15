@@ -47,12 +47,25 @@ import json
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 from openai import AsyncOpenAI
 
 from ..config import settings
 from .tools import TOOL_SPECS, ToolContext, dispatch_tool
+
+
+def _today_header() -> str:
+    """Datetime-aware preamble prepended to the system prompt.
+
+    Models have no built-in concept of "today". Without this, questions
+    like "how much time until X's birthday" or "how old is X now" fail
+    because the model can't compute durations against the present.
+    Computed per-request so it's always current.
+    """
+    now = datetime.now()
+    return f"TODAY IS: {now.strftime('%A, %Y-%m-%d')}"
 
 # Hard ceiling on agent reasoning steps. Each step is one LLM call +
 # (optionally) one tool dispatch per requested tool. 5 → at most 5 LLM
@@ -145,7 +158,10 @@ async def run_agent(
     """
     history = history or []
     messages: list[dict] = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": f"{_today_header()}\n\n{AGENT_SYSTEM_PROMPT}",
+        },
         *history,
         {"role": "user", "content": question},
     ]

@@ -11,10 +11,21 @@ Split into:
 """
 
 from collections.abc import AsyncIterator
+from datetime import datetime
 
 from openai import AsyncOpenAI
 
 from ..config import settings
+
+
+def _today_header() -> str:
+    """Prepended to the system prompt so the model knows "today".
+
+    Without this, questions involving time ("how old is X now", "how
+    many days until Y") fail because the model has no temporal anchor.
+    Computed per-request — always current.
+    """
+    return f"TODAY IS: {datetime.now().strftime('%A, %Y-%m-%d')}"
 
 SYSTEM_PROMPT = """You are Mem Palace, an assistant that helps a user explore their saved memory.
 
@@ -44,7 +55,12 @@ def build_chat_messages(
         "\n\n".join(f"[{i + 1}] {c['content']}" for i, c in enumerate(chunks))
         or "(no context found in user memory)"
     )
-    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages: list[dict] = [
+        {
+            "role": "system",
+            "content": f"{_today_header()}\n\n{SYSTEM_PROMPT}",
+        }
+    ]
     if history:
         messages.extend(history)
     messages.append(

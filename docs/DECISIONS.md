@@ -80,6 +80,78 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-021 — Reflection loop (LLM-as-judge with bounded retry) — P3.2
+
+**Date:** 2026-05-16
+
+**Context.** P3.1's bare agent loop produces good answers most of the time, but live audit caught two recurring failure modes:
+1. **Multi-part questions get partial answers.** Ex: *"how much time does sumit have for eijuuu's birthday and what can he give?"* — answer covered the date but skipped the gift suggestion.
+2. **The agent sometimes answers from conversation memory without re-verifying with tools.** Ex: *"what does he like?"* (with prior agent context about Sumit in history) returned an answer with zero fresh tool calls. Happened to be right because the data hadn't changed; would break the moment notes are updated.
+
+A judge model can catch both. Same pattern as the reranker — a separate LLM call that scores something the primary model produced — but applied to the *answer* rather than to retrieved chunks.
+
+**Decision.** Add a reflection step after the agent's first attempt completes:
+
+```
+attempt 1 → final answer
+   ↓
+judge (gpt-4o-mini, JSON mode, max 200 tokens) scores 1-5 on grounding + completeness
+   ↓
+emit SSE `reflection` event with {score, issues, retrying}
+   ↓
+IF score < REFLECTION_RETRY_BELOW (=4) AND should_retry:
+    append [rejected answer + judge feedback] to history
+    attempt 2 — same agent loop, sees the rejected answer + feedback
+    (no second judge — cap at 1 retry to avoid ping-pong)
+```
+
+The retry runs through the full agent loop again, but with the conversation history augmented so the model sees:
+1. Original question
+2. Its own rejected answer (as an assistant turn)
+3. The judge's issues (as a user turn, phrased as feedback)
+
+This is more powerful than just "try once more" — the agent typically chooses different tool calls in response to the feedback (more `read_node` calls if the judge complained about thin grounding, an additional `search_memory` if the issue was missing context).
+
+**Defensive design (same pattern as rewriter/reranker).** Judge parse failures default to `score=5, should_retry=false` — we don't trust a buggy judge response to FORCE a retry. The cost of a missed retry is low (slightly worse answer); the cost of forced retries on every transient API failure is real money. The retry threshold is enforced server-side (`score < settings.reflection_retry_below`) — we don't trust the model's `should_retry` flag alone.
+
+**SSE protocol.** New `reflection` event between the two attempts. Every event in the second attempt is tagged with `attempt: "retry"` (versus default `"first"`) so the UI can render a "retry attempt" divider between the two passes.
+
+**Observability.** Migration `0013` adds `reflection_score`, `reflection_retried`, `reflection_issues` to `chat_logs`. `tool_call` entries in `agent_tool_calls` jsonb are also tagged with `attempt`. /insights can split "passed first try" from "needed a retry" cleanly + surface judge issues for debugging.
+
+**Consequence.**
+- Pro: Catches the multi-part / shallow-grounding failure modes that the P3.1 loop alone couldn't notice.
+- Pro: Visible to the user as a colored chip (green 5, lime 4, amber 3, orange 2, red 1) with expandable issues. The system is *explicit* about its own confidence rather than hiding it.
+- Pro: Self-improving without us writing recovery logic. The agent's response to feedback uses the same loop + tools — we just gave it more context.
+- Con: +1 LLM call always when reflection is enabled (the judge). ~1.3× cost on no-retry, ~2-3× on retry. Per-turn cap (`MAX_ITERATIONS=5` × 2 attempts + 1 judge = 11 LLM calls worst-case) bounds the runaway scenario.
+- Con: Cap at 1 retry. If both attempts score low, we ship the second one regardless — visible in /insights as `reflection_retried=true` AND `reflection_score < 4`. Could iterate further, but each round adds judge + agent cost.
+- Con: Judge is the same model class as the agent. There's a subtle risk of "the judge agrees with the agent's mistakes" (calibration collapse). Mitigated by the judge seeing the tool log (it can verify grounding) but not eliminated — would need a different model class or model size for true independence. Acceptable for v1.
+
+**Future work.**
+- **Adaptive threshold per question type.** Right now `REFLECTION_RETRY_BELOW=4` is global. Multi-part questions might want stricter (5), simple factual questions could accept 3. Adds complexity; defer until we have eval data.
+- **Skip the judge when the agent is confident.** If attempt 1 made N tool calls and produced a well-structured answer with citations, the prior probability of a low judge score is low. A cheap heuristic gate could save the judge call on the easy cases.
+- **Add reflection to the eval harness.** Today `make evals` measures retrieval recall; it doesn't measure agent-answer quality. An agent-eval mode could run `/agent` against questions where we know the correct answer, then score the agent's answer with a judge call — and report retry rate as a signal.
+
+### Amendment (same-day, audit-driven) — second judge on retry
+
+**Context.** Live audit of the very first reflection-enabled runs surfaced a real UX issue: the chip showed `judge 2/5 — retrying with feedback` next to an answer that was actually *good* (the retry calculated 107 days correctly). The user reasonably asked: *"shouldn't there be 2 judge calls? what did the second one say?"* The original ADR explicitly said "no second judge — cap at 1 retry to avoid ping-pong" but didn't notice that this left the user staring at a score for the *rejected* answer rather than the *shipped* one.
+
+**Decision.** Add a second judge call after retry. Total worst case: +2 LLM calls when retry triggers (was +1). Ship the higher-scoring attempt; tie goes to retry (had more context to work with). When the retry scored *worse*, restore the first attempt's answer with a `final` event tagged `attempt: "first-restored"` so the UI bubble corrects itself. Migration `0014` adds `reflection_score_first` (the first attempt's score) alongside `reflection_score` (the shipped score).
+
+**Why the original "no second judge" was wrong.**
+- The chip's score has to describe what the user is *reading*, not what we *rejected*. Without a second judge, we couldn't honestly score the shipped answer when retry happened.
+- We could be shipping a *worse* retry. If the model overcorrects on the judge's feedback and produces a worse answer, the original design would ship it because we never compared. Now we compare.
+- "Ping-pong" risk is real but bounded: we still cap at *1 retry*. There are 2 judge calls but only 2 agent attempts. The cycle terminates.
+
+**SSE protocol.** The `reflection` event now fires once after each attempt's judge call. The second event carries `attempt: "retry"` and `score_first` so the UI can render either "shipped 5/5 (was 2/5, retried)" or "shipped 2/5 (retry scored 1/5 — kept first)" — accurate either way.
+
+**Cost shape (updated).**
+- No-retry: still +1 LLM call (the judge).
+- Retry: +2 LLM calls (first judge + retry agent run + second judge). Slightly more than the original design but the right cost for the right visibility.
+
+**Why this is a same-day amendment, not a separate ADR.** The audit caught the issue before P3.2 was committed. Folding the fix into the same commit means the shipped state of P3.2 is more honest than the originally-designed state.
+
+---
+
 ## ADR-020 — Hand-written agent loop (no framework) — P3.1
 
 **Date:** 2026-05-15

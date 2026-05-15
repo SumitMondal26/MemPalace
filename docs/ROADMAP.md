@@ -52,7 +52,7 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [ ] **Recursive token-aware chunking** that respects markdown headings + paragraph boundaries.
 - [ ] **Redis + arq** — ingestion moves off the request path into background jobs.
 
-## P3 — Agents 🟡 ~20% shipped (P3.1)
+## P3 — Agents 🟡 ~40% shipped (P3.1 + P3.2)
 
 **Learning goal:** Tool-using agents, reflection loops, multi-step orchestration without LangChain.
 
@@ -64,10 +64,9 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [x] **ChatPanel agent-mode toggle** — checkbox routes between `/chat` and `/agent`. Trace UI renders each tool call as a collapsible row (icon + name + args, click to expand args/result).
 - [x] **Iteration-cap behavior** — when hit, agent makes one final no-tools LLM call to force a summary. Amber chip in UI surfaces the cap-hit case.
 - [x] Migration `0012_chat_logs_agent` — adds is_agent / agent_iterations / agent_tool_calls / agent_hit_iter_cap.
+- [x] **Reflection loop (P3.2)** — `services/reflection.py` LLM-as-judge scores agent answer 1-5 on grounding + completeness; score < 4 + should_retry triggers ONE more agent attempt with rejected answer + judge feedback in the history. Cap at 1 retry (no ping-pong). New SSE `reflection` event; events tagged with `attempt: "first" | "retry"` for UI separation. Migration 0013 (reflection_score / reflection_retried / reflection_issues). UI: color-tiered chip (green→red) with expandable issues; "retry attempt" divider in the trace. ADR-021.
 
 ### Remaining
-
-- [ ] **Reflection loop (P3.2)** — judge model critiques agent's final answer, agent retries if grounding score is low. New `EVAL_REFLECTION` flag in the harness.
 - [ ] **Write tools (P3.3)** — `create_summary_node`, `link_nodes` with confirmation UX, audit table, undo affordance. The "agent can mutate your graph" boundary.
 - [ ] **Memory agent (P3.4)** — autonomous curator. Runs from a button; later scheduled. Reviews clusters, proposes summary nodes.
 - [ ] **Research agent (P3.5)** — web fetch + search tools. Question expands the graph from external sources. Aggressive cost cap.

@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     # but auto-skips when the top candidate clearly dominates (sim gap > 0.10).
     rerank_enabled: bool = True
 
+    # Agent reflection — after /agent produces a final answer, an LLM judge
+    # scores it 1-5 on grounding + completeness. If score < REFLECTION_RETRY_BELOW
+    # and we haven't already retried, the agent gets ONE more attempt with
+    # the judge's issues fed back as context. Cap at 1 retry. Adds 1-2 LLM
+    # calls per agent turn worst-case (judge + maybe a second agent run).
+    reflection_enabled: bool = True
+    # Score strictly below this triggers a retry. 4 = "needs improvement"
+    # threshold on a 1-5 rubric (5 perfect, 4 good enough, 3 mediocre).
+    reflection_retry_below: int = 4
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.api_cors_origins.split(",") if o.strip()]
