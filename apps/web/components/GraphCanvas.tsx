@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import * as THREE from "three";
 
 import { type ClusterIndex, buildClusters, buildClusterIndexFromDb } from "@/lib/clusters";
@@ -20,6 +20,14 @@ import { useGraphStore } from "@/lib/store";
  *  - Three.js can't SSR — we dynamic-import with ssr:false.
  */
 
+// Cast to ComponentType<any> so all of the dozens of callback props below
+// (nodeColor, nodeLabel, nodeThreeObject, linkColor, linkWidth, ...) can
+// take our local GNode/GLink types instead of the lib's generic node shape.
+// The library's prop types are deeply generic over the node-data type, and
+// next/dynamic erases that generic — strict TS then rejects every callback
+// where we type the arg as our app-specific GNode (missing `type`, `title`,
+// `clusterColor`, etc on the lib's bare node shape). One cast here = zero
+// per-prop @ts-expect-error noise downstream.
 const ForceGraph3D = dynamic(() => import("react-force-graph-3d"), {
   ssr: false,
   loading: () => (
@@ -27,7 +35,7 @@ const ForceGraph3D = dynamic(() => import("react-force-graph-3d"), {
       Spinning up your palace…
     </div>
   ),
-});
+}) as unknown as ComponentType<Record<string, unknown>>;
 
 const TYPE_COLOR: Record<string, string> = {
   note: "#22d3ee",
@@ -411,11 +419,6 @@ export default function GraphCanvas({
   return (
     <div ref={containerRef} className="h-full w-full">
       <ForceGraph3D
-        // Our local FGRef is a hand-rolled duck-typed subset of the lib's
-        // ForceGraphMethods<NodeType> — narrow on purpose so we only depend on
-        // the few methods we actually call (scene/camera/zoomToFit/cameraPosition).
-        // Strict TS rejects assigning the narrower ref to the lib's full ref slot.
-        // @ts-expect-error - intentional structural-typing widening
         ref={fgRef}
         graphData={data}
         width={size.width}
