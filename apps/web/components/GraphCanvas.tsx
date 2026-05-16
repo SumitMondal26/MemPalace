@@ -411,6 +411,11 @@ export default function GraphCanvas({
   return (
     <div ref={containerRef} className="h-full w-full">
       <ForceGraph3D
+        // Our local FGRef is a hand-rolled duck-typed subset of the lib's
+        // ForceGraphMethods<NodeType> — narrow on purpose so we only depend on
+        // the few methods we actually call (scene/camera/zoomToFit/cameraPosition).
+        // Strict TS rejects assigning the narrower ref to the lib's full ref slot.
+        // @ts-expect-error - intentional structural-typing widening
         ref={fgRef}
         graphData={data}
         width={size.width}
