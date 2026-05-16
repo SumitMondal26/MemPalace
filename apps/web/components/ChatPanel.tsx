@@ -167,9 +167,54 @@ export default function ChatPanel() {
     });
   }, [messages]);
 
-  async function send() {
-    const q = input.trim();
+  // Programmatic "ask the chat panel a question" hook.
+  // Other components (e.g. the "🧠 Curate memory" button in
+  // GraphPageClient) dispatch a `mempalace:ask` CustomEvent on window
+  // with `{question, agent}` in `detail`. The chat panel opens itself,
+  // takes the message, and runs send() through whichever endpoint the
+  // event requests.
+  //
+  // Why custom event vs forwardRef: ChatPanel is rendered deep in
+  // GraphPageClient and other places might want to ask things too
+  // (hotkeys, future MemoryAgent variants). Pub-sub keeps the chat
+  // panel decoupled from its callers.
+  //
+  // Why the sendRef: `send` closes over current state (messages,
+  // loading). A useEffect that captures `send` at mount would call a
+  // stale closure forever. Updating sendRef each render lets the
+  // listener invoke the LATEST send without re-binding the listener.
+  // Type allows undefined because the ref is set in the layout effect
+  // below — strict-mode safe vs initializing with a hoisted function.
+  const sendRef = useRef<
+    ((opts?: { question?: string; agent?: boolean }) => Promise<void>) | null
+  >(null);
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const ce = e as CustomEvent<{ question?: string; agent?: boolean }>;
+      const q = ce.detail?.question?.trim();
+      if (!q) return;
+      setOpen(true);
+      // Defensive: the listener binds once at mount; sendRef gets its
+      // value assigned later in the render body. If something racy
+      // fires before that runs, drop the event silently — caller can
+      // retry. In practice never observed.
+      if (!sendRef.current) return;
+      void sendRef.current({ question: q, agent: ce.detail?.agent });
+    };
+    window.addEventListener("mempalace:ask", handler);
+    return () => window.removeEventListener("mempalace:ask", handler);
+  }, []);
+
+  async function send(override?: { question?: string; agent?: boolean }) {
+    const q = (override?.question ?? input).trim();
     if (!q || loading) return;
+
+    // Optional one-shot agent-mode override (used by features like
+    // "Curate memory" that ALWAYS want the agent path regardless of the
+    // user's current toggle state). Doesn't persist — the toggle stays
+    // whatever it was.
+    const useAgent =
+      typeof override?.agent === "boolean" ? override.agent : agentMode;
 
     // Snapshot conversation history BEFORE adding the new turn so the
     // request body sees only completed prior turns. Drop empty placeholders
@@ -178,7 +223,7 @@ export default function ChatPanel() {
       .filter((m) => m.content.trim().length > 0)
       .map((m) => ({ role: m.role, content: m.content }));
 
-    setInput("");
+    if (override?.question === undefined) setInput("");
     setLoading(true);
 
     setMessages((m) => [
@@ -196,8 +241,8 @@ export default function ChatPanel() {
     }
 
     try {
-      const endpoint = agentMode ? "/agent" : "/chat";
-      const body = agentMode
+      const endpoint = useAgent ? "/agent" : "/chat";
+      const body = useAgent
         ? { question: q, history }
         : { question: q, k: 5, history };
       const res = await fetch(`${API_BASE}${endpoint}`, {
@@ -223,6 +268,12 @@ export default function ChatPanel() {
       setLoading(false);
     }
   }
+
+  // Always point the ref at the latest send closure — assigned after `send`
+  // is defined to avoid any temporal-dead-zone footguns. The custom-event
+  // listener (mounted once) dereferences sendRef.current on each call so
+  // it sees the latest state-aware send.
+  sendRef.current = send;
 
   function mutateLastAssistant(fn: (m: Message) => Message) {
     setMessages((all) => {

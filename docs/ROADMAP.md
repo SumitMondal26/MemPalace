@@ -52,7 +52,7 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [ ] **Recursive token-aware chunking** that respects markdown headings + paragraph boundaries.
 - [ ] **Redis + arq** — ingestion moves off the request path into background jobs.
 
-## P3 — Agents 🟡 ~60% shipped (P3.1 + P3.2 + P3.3)
+## P3 — Agents 🟡 ~80% shipped (P3.1 + P3.2 + P3.3 + P3.4)
 
 **Learning goal:** Tool-using agents, reflection loops, multi-step orchestration without LangChain.
 
@@ -69,7 +69,7 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [x] **Write tools — P3.3 (propose-then-approve)** — `create_note` (initially shipped as `propose_summary_node`; renamed in migration 0016 once we realized users save lots of things that aren't summaries) queues a proposal during the agent loop; user reviews + approves/rejects via per-row buttons in the chat panel; on approve, server runs the full note-save chain (insert → embed → rebuild_semantic_edges → recompute_clusters). Migrations 0015 + 0016 (`agent_actions` table). Two endpoints `POST /agent/proposals/{id}/{approve|reject}` with status-pending guard for idempotency. SSE `proposals` event surfaces the persisted action ids to the UI. ADR-022.
 
 ### Remaining
-- [ ] **Memory agent (P3.4)** — autonomous curator. Runs from a button; later scheduled. Reviews clusters, proposes summary nodes via the P3.3 propose-then-approve pipeline.
+- [x] **Memory agent (P3.4)** — 🧠 Curate memory button in the canvas controls. Fires a hardcoded curation prompt at `/agent` via ChatPanel's `mempalace:ask` custom-event hook. Agent uses existing read tools to explore + `create_note` (from P3.3) to propose summaries. Reuses every piece of the substrate — reflection retry, proposals card, audit table, auto-recompute, glow on new nodes. ~40 lines of frontend code, zero backend changes. ADR-023.
 - [ ] **Research agent (P3.5)** — web fetch + search tools. Question expands the graph from external sources. Aggressive cost cap.
 - [ ] **Retrieval agent (variant)** — rewrites queries, decides between vector / fulltext / graph traversal. Could be a single specialized tool rather than a whole agent.
 

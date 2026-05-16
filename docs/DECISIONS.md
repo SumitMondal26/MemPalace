@@ -80,6 +80,49 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-023 — Memory agent: button-triggered curation, no new agent variant (P3.4)
+
+**Date:** 2026-05-16
+
+**Context.** P3.4 calls for an "autonomous curator" that reviews the graph and proposes summary notes for under-curated clusters. Naive shape: a new endpoint, a new agent loop variant, a new tool set. But the more we built P3.3 the more it was obvious that "memory agent" is just *the existing agent with a specific instruction* — the read tools (search_memory, read_node, list_clusters, read_cluster_members) cover exploration; `create_note` covers writes; reflection covers quality; the proposals card covers approval.
+
+**Decision.** Memory agent = **a button + a hardcoded curation prompt**. Click triggers a `window.dispatchEvent('mempalace:ask', {question, agent: true})` custom event. ChatPanel listens, opens itself, runs the prompt through `/agent` exactly as if the user had typed it. Same agent loop, same reflection, same proposals card.
+
+Zero backend changes. ~40 lines of frontend wiring (one event handler in ChatPanel, one button + prompt in GraphPageClient).
+
+The prompt itself is the "specialization":
+1. `list_clusters` to see topics
+2. For each cluster with 3+ members, `read_cluster_members` then read the relevant members
+3. Skip clusters that already have a summary node
+4. Propose `create_note` for up to 3 clusters worth summarizing
+5. End with a narrative explaining what got proposed
+
+**Why this shape over a dedicated endpoint:**
+- **The agent IS the curator.** Adding a parallel loop would be code duplication for no behavior difference.
+- **Reuse compounds.** Reflection retry catches a shallow curation answer for free. The TODAY header is already in the system prompt. The same proposals card the user already knows handles the approvals.
+- **Cheaper to evolve.** Adding more curation modes (e.g. "find duplicate notes", "find broken edges") becomes "new button + new prompt" — no architecture change.
+- **Honest framing.** Memory agent isn't a different kind of intelligence; it's the same agent with a different opening question. Calling it that prevents over-engineering.
+
+**Why ChatPanel listens to a custom event vs forwardRef/imperative handle:**
+- ChatPanel sits deep in GraphPageClient; getting a ref through requires prop drilling.
+- Future features (keyboard shortcuts, command palette, scheduled curate runs) might also need to ask the chat panel things. Pub-sub via window event keeps the surface decoupled.
+- `sendRef` pattern inside the listener avoids stale-closure pitfalls — listener bound once at mount, sendRef.current always points to the latest send.
+
+**Consequence.**
+- Pro: Cheapest possible P3.4 — substrate from P3.1-3.3 carries it. ~40 lines of code total.
+- Pro: Every curation proposal goes through the same review UI users already know.
+- Pro: Adding more curator buttons (find duplicates, suggest links) follows the same pattern.
+- Con: The "memory agent" feels less special than the framing implies. It's just a prompt. Some users might expect a separate dashboard/timeline of agent activity (an /insights tab for curate runs). Defer — can be built later atop the same `agent_actions` audit table.
+- Con: Memory agent runs are mixed with user chat in the chat panel — there's no separate "curate history" view. Could become noisy if used often.
+- Con: Currently button-only (one-shot, user-triggered). True scheduled background curation would need a worker (Redis+arq or cron-style). Deferred to when load justifies it.
+
+**Future work.**
+- Scheduled memory agent — weekly background sweep, queue proposals while user is away, surface as a badge on the canvas on next visit.
+- More curator buttons — *Find duplicates*, *Find broken edges*, *Suggest links*.
+- Curate-run history view on `/insights` — show what got proposed, what got approved, approval rate over time.
+
+---
+
 ## ADR-022 — Agent write tools via propose-then-approve (P3.3)
 
 **Date:** 2026-05-16

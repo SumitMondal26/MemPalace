@@ -149,6 +149,52 @@ export default function GraphPageClient({
     await runAutoConnect();
   }
 
+  /** "🧠 Curate memory" — P3.4 memory agent. Fires a curation prompt at
+   *  `/agent` via ChatPanel's mempalace:ask event hook. The agent uses
+   *  the existing read tools to explore + the create_note write tool to
+   *  propose summaries for under-curated clusters. Every proposal goes
+   *  through the same approval card the user already knows.
+   *
+   *  No new endpoint, no new agent loop variant — the "memory agent" is
+   *  just the regular agent with a different opening question. The
+   *  substrate built in P3.1/P3.2/P3.3 (loop + reflection + propose-then-
+   *  approve) carries it all. */
+  function curateMemory() {
+    const prompt = [
+      "Review my memory palace and propose summary notes for clusters",
+      "that would genuinely benefit from one. Be SELECTIVE — quality over",
+      "quantity. Each proposal needs my approval before anything is created.",
+      "",
+      "Process:",
+      "1. Call list_clusters() to see what topics exist.",
+      "2. For each cluster with 3 or more members, call",
+      "   read_cluster_members(cluster_id) to inspect its contents.",
+      "3. SKIP a cluster if ANY of these are true:",
+      "   - It already contains a member whose title starts with 'Summary'",
+      "     or contains the word 'summary' (don't double-summarize).",
+      "   - It has fewer than 3 members.",
+      "   - Its members are short single-sentence notes that already say",
+      "     what they need to say (a summary would add nothing).",
+      "4. For up to 3 REMAINING clusters worth summarizing, read the most",
+      "   relevant members with read_node and propose ONE create_note per",
+      "   cluster. NEVER propose two notes for the same cluster — one",
+      "   proposal per cluster, period.",
+      "5. End with a short message naming which proposals you made (or",
+      "   say plainly that nothing needs summarizing).",
+      "",
+      "If you find yourself wanting to propose a 4th summary, prefer to",
+      "stop instead — the user can run Curate again later. If you find",
+      "yourself proposing duplicates, you've made a mistake — drop the",
+      "duplicate before responding.",
+    ].join("\n");
+
+    window.dispatchEvent(
+      new CustomEvent("mempalace:ask", {
+        detail: { question: prompt, agent: true },
+      }),
+    );
+  }
+
   /** "🏷 Recompute topics" — k-means + LLM-named clusters via the API. */
   async function runRecomputeClusters() {
     setRecompute("running");
@@ -289,6 +335,18 @@ export default function GraphPageClient({
             {recomputeMsg}
           </span>
         )}
+
+        {/* P3.4 memory agent — fires a curation prompt at /agent through
+            ChatPanel via the global custom-event hook. Opens the chat
+            panel + runs the agent + surfaces any create_note proposals
+            in the existing approval card. */}
+        <button
+          onClick={curateMemory}
+          className="rounded-lg bg-violet-500/15 px-3 py-1.5 text-xs font-medium text-violet-300 ring-1 ring-violet-500/40 backdrop-blur hover:bg-violet-500/25"
+          title="Ask the agent to review your memory and propose summary notes for under-curated clusters. Each proposal needs your approval before anything is created."
+        >
+          🧠 Curate memory
+        </button>
 
         {/* Edge-strength legend */}
         <div className="mt-1 space-y-1 rounded-lg bg-palace-panel/80 px-3 py-2 text-[10px] text-neutral-300 ring-1 ring-palace-edge backdrop-blur">
