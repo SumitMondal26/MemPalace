@@ -410,7 +410,6 @@ export default function GraphCanvas({
 
   return (
     <div ref={containerRef} className="h-full w-full">
-      {/* @ts-expect-error - dynamic-imported component types don't carry through cleanly */}
       <ForceGraph3D
         ref={fgRef}
         graphData={data}
