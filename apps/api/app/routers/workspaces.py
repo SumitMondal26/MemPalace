@@ -41,11 +41,14 @@ async def rebuild_semantic_edges(
     # Auto-connect v2.1 (migration 0006): best-pair-chunk + kNN per node +
     # minimum-weight floor.
     # K=3 → each node gets up to 3 of its most-similar partners.
-    # min_weight=0.25 → drops weak edges even if they're top-K. Real semantic
-    # matches in short-text corpora score >= 0.30; below ~0.25 are structural
+    # min_weight=0.30 → drops weak edges even if they're top-K. Audit
+    # surfaced spurious low-weight connections (e.g. agent-saved notes
+    # linking to unrelated Summary nodes via shared keywords). Raised
+    # from 0.25 → 0.30 after live observation: real semantic matches in
+    # this corpus score >= 0.30 reliably; below that is structural
     # false-friends ("people doing things together" patterns, etc.).
     k_neighbors: int = 3,
-    min_weight: float = 0.25,
+    min_weight: float = 0.30,
 ) -> RebuildEdgesResponse:
     """Rebuild the workspace's semantic edges via best-pair-chunk + kNN.
 

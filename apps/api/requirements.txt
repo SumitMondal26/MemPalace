@@ -16,3 +16,9 @@ ruff==0.7.4
 # keeps ABI compat with sklearn's compiled wheels. ~80MB to the API image.
 numpy==1.26.4
 scikit-learn==1.5.2
+
+# Research agent web fetch (P3.5 — see ADR-024).
+# bs4 = HTML parsing; lxml = fast C-backed parser bs4 uses. ~5MB combined.
+# httpx (already above) handles the network with timeout + size guards.
+beautifulsoup4==4.12.3
+lxml==5.3.0

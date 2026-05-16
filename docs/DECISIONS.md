@@ -80,6 +80,65 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-024 — Research agent: ship `web_fetch` only, defer `web_search` (P3.5)
+
+**Date:** 2026-05-16
+
+**Context.** P3.5 calls for a "research agent" that takes a question and expands the graph from web results. The complete shape is: search → fetch → extract → propose. Each piece adds cost, surface area, and external trust.
+
+**Decision.** Ship `web_fetch(url)` as the only new tool. Defer `web_search` to v2.
+
+The agent now has:
+- All P3.1-3.4 read tools over the user's own memory
+- `web_fetch(url)` — fetch + extract from any http(s) URL the user names
+- `create_note(...)` — the P3.3 write tool, now usable for web-sourced notes
+
+The user pastes a URL (or names one in the question), agent fetches via `web_fetch`, extracts main content via BeautifulSoup, returns ~6000 chars of text. Agent reasons over it, possibly fetches more URLs, uses `create_note` to propose saving. Same approval card the user already knows.
+
+**Why no search in v1:**
+- **Cost certainty.** Brave/Tavily/SerpAPI all cost $5-50/mo and bring vendor lock-in. Fetch costs $0 — just bandwidth.
+- **The pattern stands alone.** "Read this URL → save it" is half the research workflow; the other half (discovering the URL) can ride on the user typing it. Validates the external-source → graph loop with no third-party billing.
+- **Search is a v2 upgrade in ~30 lines.** Once `web_fetch` is solid, adding `web_search` is one schema + one dispatch function. Same architecture.
+
+**Safety guards (load-bearing — this is the only tool that talks to the open internet):**
+- **SSRF prevention**: refuse any URL whose hostname resolves to a private / loopback / link-local IP. Re-validates AFTER redirects so an attacker can't 302 us to `http://169.254.169.254`.
+- **Scheme restriction**: http(s) only. Rejects `file://`, `javascript:`, `data:`, etc.
+- **10s timeout** via `httpx.Timeout`.
+- **5MB size cap** enforced during streaming, breaks early.
+- **Content-type filter**: `text/html`, `text/plain`, `application/xhtml+xml`. PDFs and binary types refused (different extraction story for those — could add via pypdf later).
+- **Honest User-Agent**: `MemPalace/1.0 (+research agent)`. No spoofing.
+- **DNS failure fails closed**: on getaddrinfo errors, treat as private/unreachable (better to fail than open).
+- **Defensive parsing**: BeautifulSoup with lxml, strips script/style/nav/header/footer/aside/form/button/svg/template tags before extracting text. Article-shape preference (`<article>` → `<main>` → `[role=main]` → `<body>`).
+
+**Why this lib stack:**
+- `httpx` already in deps. Async, supports streaming, timeout, redirects natively.
+- `beautifulsoup4 + lxml`: standard Python pair for "parse arbitrary HTML cleanly". lxml backend is fast (C-extensions). Combined ~5MB to the image.
+- Considered `trafilatura` (purpose-built main-content extractor): higher quality, but heavier dep + lxml-dependent. The BS4+heuristics approach is good enough for clean blog/paper/article pages, which is the realistic v1 audience.
+- Considered `Playwright` for JS pages: massive (200MB+ headless Chromium) for v1; defer.
+
+**Cost shape:**
+- web_fetch: $0 per call (just bandwidth). Agent cost goes up by ~500-1500 tokens per fetched page (extracted text added to message history). Typical research turn: 2-3 fetches → ~2-4× the cost of a memory-only agent turn (~$0.005-0.02 per turn).
+- No external API fees in v1.
+
+**Consequence.**
+- Pro: First-class "agent reads external sources" without depending on a paid search API.
+- Pro: The propose-then-approve pipeline (P3.3) handles all writes — web-sourced notes go through the same approval card, get embedded + auto-connected + clustered identically.
+- Pro: Adding `web_search` later is mechanical (one tool + one provider integration). Substrate doesn't need to change.
+- Pro: SSRF guards are correct-by-default — the failure mode of any misuse is "tool returns error", not "server leaks signed URL / hits cloud metadata endpoint".
+- Con: Without search, the agent can't *discover* URLs on its own. User has to paste them. Cuts the use case in half.
+- Con: JS-heavy pages (most social media, lots of SaaS docs sites) extract poorly or empty. Will need a Playwright fallback or per-domain handlers later.
+- Con: PDFs not handled. Common research artifact. Could pipe via pypdf (already in deps) — small follow-up.
+- Con: Per-domain rate limiting + robots.txt politeness deferred. Single-user app today, low real-world impact, but should be added before any kind of multi-tenant launch.
+
+**Future work (v2 of P3.5).**
+- `web_search(query)` via Brave or Tavily. Behind a `RESEARCH_SEARCH_ENABLED` env flag so users can opt in to the API cost.
+- PDF fetching path: detect `application/pdf`, route through pypdf → text.
+- Per-domain rate limiter (one cheap counter in Redis once arq lands for P2's final piece).
+- `robots.txt` honoring (best-effort).
+- Provider extraction: rename `_extract_main_text` into a strategy module so per-domain handlers can plug in (e.g. arxiv.org has structured abstracts we shouldn't extract via heuristics).
+
+---
+
 ## ADR-023 — Memory agent: button-triggered curation, no new agent variant (P3.4)
 
 **Date:** 2026-05-16

@@ -41,6 +41,7 @@ from openai import AsyncOpenAI
 from supabase import Client
 
 from .retrieval import embed_query, search_chunks_with_neighbors
+from .web_fetch import fetch_url
 
 # Postgres uuid type rejects anything that isn't a real UUID. Validating in
 # Python first lets us return a *helpful* error to the LLM ("you passed a
@@ -157,6 +158,36 @@ TOOL_SPECS: list[dict] = [
                     },
                 },
                 "required": ["cluster_id"],
+            },
+        },
+    },
+    # ----- EXTERNAL tools (P3.5 — talk to the open web) -----
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "Fetch an http(s) URL and return its main readable content "
+                "(article body, paper abstract, blog post, etc.). Use when "
+                "the user gives you a URL to read, or asks you to research "
+                "something against a specific source they reference. The "
+                "fetch is bounded: 10s timeout, 5MB max, only html/plain. "
+                "JS-heavy pages may return little or no content — fall "
+                "back to asking the user for a static-readable URL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": (
+                            "Full http or https URL to fetch. Must include "
+                            "the scheme. Private / loopback addresses are "
+                            "rejected."
+                        ),
+                    },
+                },
+                "required": ["url"],
             },
         },
     },
@@ -406,6 +437,28 @@ async def _tool_read_cluster_members(
     ]
 
 
+async def _tool_web_fetch(ctx: ToolContext, args: dict) -> dict:
+    """Wraps services.web_fetch.fetch_url. Returns a slim dict the LLM
+    can read efficiently — capping `text` here at the same MAX_TEXT_CHARS
+    the service uses, so the agent's context doesn't balloon across
+    multiple fetches in one run.
+    """
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"error": "url is required"}
+    result = await fetch_url(url)
+    if not result.ok:
+        return {"error": result.error or "fetch failed", "url": url}
+    return {
+        "url": result.url,
+        "final_url": result.final_url,
+        "title": result.title,
+        "text": result.text,
+        "content_type": result.content_type,
+        "byte_length": result.byte_length,
+    }
+
+
 async def _tool_create_note(
     ctx: ToolContext, args: dict
 ) -> dict:
@@ -474,6 +527,7 @@ _DISPATCH = {
     "read_node": _tool_read_node,
     "list_clusters": _tool_list_clusters,
     "read_cluster_members": _tool_read_cluster_members,
+    "web_fetch": _tool_web_fetch,
     "create_note": _tool_create_note,
 }
 

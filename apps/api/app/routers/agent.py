@@ -589,7 +589,7 @@ async def approve_proposal(
     try:
         sb_user.rpc(
             "rebuild_semantic_edges",
-            {"ws_id": str(workspace_id), "k_neighbors": 3, "min_weight": 0.25},
+            {"ws_id": str(workspace_id), "k_neighbors": 3, "min_weight": 0.30},
         ).execute()
     except Exception:
         # Auto-connect failure shouldn't roll back the node either —

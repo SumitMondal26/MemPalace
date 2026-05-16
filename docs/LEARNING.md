@@ -233,7 +233,7 @@ similarity(A, B) = MAX over (chunk_a in A, chunk_b in B) of cosine(chunk_a, chun
 
 ## 3.3 Min-weight floor (kNN's safety net)
 
-**What.** After kNN selects top-K partners per node, drop any edge with similarity below an absolute floor (0.25 default).
+**What.** After kNN selects top-K partners per node, drop any edge with similarity below an absolute floor (0.30 default; was 0.25 in early P2.5 builds, raised after live audit caught spurious low-weight links between an agent-saved note and unrelated summaries).
 
 **Why.** kNN guarantees connectivity but not quality. A node with 4 weak partners and no strong ones will have its top-3 forced through anyway — those edges are usually "people doing things together"-style surface-form noise. The floor catches them.
 

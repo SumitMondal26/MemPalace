@@ -262,7 +262,7 @@ Click "+ Add memory ▸" → dropdown → pick type
            → chunk + batch-embed via OpenAI
            → INSERT new chunks
        - POST /workspaces/{id}/rebuild-edges
-           → SQL function: best-pair-chunk + kNN (K=3) + min-weight (0.25)
+           → SQL function: best-pair-chunk + kNN (K=3) + min-weight (0.30, raised from 0.25 after audit)
            → DELETE old kind='semantic' edges, INSERT fresh ones
        - db.listEdges(workspace_id) → store.setEdges
        - 3D canvas re-renders with new node + new edges + animated particles

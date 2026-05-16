@@ -33,7 +33,7 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 
 - [x] **Semantic edges (auto-connect v1)** via SQL function — pairwise cosine over node-mean embeddings, idempotent.
 - [x] **Auto-connect v2** — replaces threshold tuning with **best-pair-chunk** similarity (max over chunk-pair Cartesian) + **kNN per node** (each node gets top-K most-similar partners). Long docs now connect properly via best-pair-chunk; threshold knob is gone.
-- [x] **Auto-connect v2.1** — adds a **min-weight floor** (0.25) on top of kNN to drop surface-form false-friend edges that kNN otherwise forces in.
+- [x] **Auto-connect v2.1** — adds a **min-weight floor** (0.30, originally 0.25; raised after audit) on top of kNN to drop surface-form false-friend edges that kNN otherwise forces in.
 - [x] **Evals harness** — JSON golden set + standalone Python runner (`make evals`) measuring recall@1/3/5/10 + MRR. A/B switching via `EVAL_STRATEGY` env var.
 - [x] **Graph-augmented retrieval (1-hop)** — `match_chunks_with_neighbors` SQL function: vector top-k + 1-hop edge expansion in one round-trip. Measured lift at stress test (k=1): recall@5 75%→100%, MRR 0.750→0.875.
 - [x] **Multi-turn chat memory** — client snapshots prior 6 messages, sends as `history`; server splices between system prompt and current Context. ADR-014 documents the design + the known weakness (vague follow-ups still embed poorly — query rewriting is the next layer).
@@ -52,7 +52,7 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [ ] **Recursive token-aware chunking** that respects markdown headings + paragraph boundaries.
 - [ ] **Redis + arq** — ingestion moves off the request path into background jobs.
 
-## P3 — Agents 🟡 ~80% shipped (P3.1 + P3.2 + P3.3 + P3.4)
+## P3 — Agents 🟢 ~95% shipped (P3.1 + P3.2 + P3.3 + P3.4 + P3.5 v1)
 
 **Learning goal:** Tool-using agents, reflection loops, multi-step orchestration without LangChain.
 
@@ -70,7 +70,8 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 
 ### Remaining
 - [x] **Memory agent (P3.4)** — 🧠 Curate memory button in the canvas controls. Fires a hardcoded curation prompt at `/agent` via ChatPanel's `mempalace:ask` custom-event hook. Agent uses existing read tools to explore + `create_note` (from P3.3) to propose summaries. Reuses every piece of the substrate — reflection retry, proposals card, audit table, auto-recompute, glow on new nodes. ~40 lines of frontend code, zero backend changes. ADR-023.
-- [ ] **Research agent (P3.5)** — web fetch + search tools. Question expands the graph from external sources. Aggressive cost cap.
+- [x] **Research agent (P3.5 v1)** — `web_fetch(url)` tool added; agent can read arbitrary http(s) URLs the user names and pipe the extracted content through `create_note` for proposed saving. SSRF prevention + 10s timeout + 5MB cap + content-type filter + scheme restriction. BeautifulSoup+lxml for main-content extraction. `web_search` deferred to v2 (cost cap + provider lock-in concerns); user pastes URLs for now. ADR-024.
+- [ ] **Research agent (P3.5 v2 — deferred)** — `web_search(query)` via Brave/Tavily behind a `RESEARCH_SEARCH_ENABLED` env flag. PDF extraction via pypdf. Per-domain rate limiter (rides on the eventual arq+Redis from P2). robots.txt honor.
 - [ ] **Retrieval agent (variant)** — rewrites queries, decides between vector / fulltext / graph traversal. Could be a single specialized tool rather than a whole agent.
 
 ## P4 — Observability & quality
