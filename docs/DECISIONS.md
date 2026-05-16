@@ -84,7 +84,7 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 **Date:** 2026-05-16
 
-**Context.** P3.1/P3.2 shipped read-only agents. The natural next step is letting the agent *write* — `create_summary_node` (turn a cluster of findings into a permanent note), `link_nodes` (manual edges), eventually rename/delete. The moment an LLM can mutate state, the design has to answer four questions: visibility (what's about to happen?), approval (who decides?), audit (what was done?), undo (recover from mistakes).
+**Context.** P3.1/P3.2 shipped read-only agents. The natural next step is letting the agent *write* — `create_note` (capture summaries, lists, journal entries, anything the user wants saved), `link_nodes` (manual edges), eventually rename/delete. The moment an LLM can mutate state, the design has to answer four questions: visibility (what's about to happen?), approval (who decides?), audit (what was done?), undo (recover from mistakes).
 
 The naive shape is "agent writes immediately; we add a server-side allow-list of safe operations." It doesn't work — an autonomous agent can still write 17 nodes a minute, none of which the user wanted. Without explicit user approval the system becomes user-hostile.
 
@@ -159,6 +159,18 @@ user clicks → POST /agent/proposals/{id}/{approve|reject}
 **Why.** Manual edges drawn by the agent collapse two distinct concepts ("user manually connected these" vs "system inferred these"). Forcing the agent's writes through the same auto-connect pipeline as user notes keeps the data model coherent — the only difference between an agent-created note and a user note is the `metadata.created_by='agent'` flag.
 
 **Cost.** One extra embed call (~$0.0001 for a typical summary) + one extra `rebuild_semantic_edges` SQL call. Same cost as a manual note save. Worth it.
+
+### Amendment (audit-driven) — tool rename: `propose_summary_node` → `create_note`
+
+**Context.** Original v1 named the write tool `propose_summary_node` because the first use case in mind was "agent reads a cluster, drafts a summary, queues a save." User caught the framing: *"user can write anything, not just summary"* — lists, journal entries, plain notes are all valid uses of the same code path. The `summary` framing was leaking an internal mental model into the public tool name.
+
+**Decision.** Migration 0016: rename the `action_type` value from `'create_summary_node'` → `'create_note'`. One canonical name everywhere (OpenAI tool schema `create_note`, dispatch function `_tool_create_note`, action_type enum, UI label). Substrate (propose-then-approve pipeline, audit row lifecycle, approve handler, UI card) stays exactly as designed — only the *name* changed.
+
+Schema description in `tools.py` also broadened: *"covers summaries, lists, journal entries, plain notes, anything they want to preserve."* Agent system prompt rewritten to drop the "summarize" framing.
+
+Old audit rows (`action_type='create_summary_node'`) get UPDATEd in the same migration — one canonical value, no forever-allow-both code paths. Audit history preserved (row identities unchanged; just the value).
+
+**Why this matters beyond cosmetics.** Future write tools (`link_nodes`, `update_node`, etc.) will live alongside `create_note` in the same agent_actions table + same UI card. Getting the naming right BEFORE multiple write tools land prevents inconsistency later.
 
 ---
 
@@ -268,7 +280,7 @@ The loop is async-iterable so the router yields SSE events as they happen — `t
 - `list_clusters()` — all clusters with member counts.
 - `read_cluster_members(cluster_id)` — node ids + titles for one cluster.
 
-Write tools (create_summary_node, link_nodes) are deferred to P3.3 — the audit/confirmation/undo story is heavier than P3.1's scope.
+Write tools (create_note shipped in P3.3 + migration 0016 rename; link_nodes deferred to v2) — gated behind the propose-then-approve pipeline.
 
 **Endpoint shape.** New `POST /agent` rather than a flag on `/chat`. Two reasons: cleaner separation in observability (`is_agent=true` column lets /insights split metrics), and the SSE protocol differs (agent emits tool_call/tool_result events that /chat doesn't have). Frontend toggle in ChatPanel routes between them.
 
@@ -293,7 +305,7 @@ Write tools (create_summary_node, link_nodes) are deferred to P3.3 — the audit
 
 **Future work (P3.2-3.5).**
 - 3.2: reflection loop — judge model critiques final answer, agent retries if low-grounded.
-- 3.3: write tools (create_summary_node, link_nodes) — gated behind a confirmation UX + audit table.
+- 3.3: write tools (create_note shipped; link_nodes deferred) — gated behind a confirmation UX + audit table.
 - 3.4: memory agent — orchestrates the read-tools to propose summaries autonomously, runs as a button-triggered job (later, scheduled).
 - 3.5: research agent — adds web-fetch tools, expands the graph from external sources. Most ambitious, most cost-aware.
 

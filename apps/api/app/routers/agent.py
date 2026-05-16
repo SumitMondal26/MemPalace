@@ -451,7 +451,7 @@ async def agent(
 # ---------------------------------------------------------------------------
 # Proposal approve / reject — P3.3 write gate.
 #
-# The agent's write tools (propose_summary_node, etc.) don't mutate the
+# The agent's write tools (create_note, etc.) don't mutate the
 # graph. They queue agent_actions rows with status='pending'. These two
 # endpoints transition status and (on approve) perform the actual write.
 #
@@ -508,7 +508,7 @@ async def approve_proposal(
     workspace_id = action["workspace_id"]
 
     # 2. Execute by action_type. Only one supported in v1.
-    if action["action_type"] != "create_summary_node":
+    if action["action_type"] != "create_note":
         raise HTTPException(
             http_status.HTTP_400_BAD_REQUEST,
             detail=f"unsupported action_type: {action['action_type']}",

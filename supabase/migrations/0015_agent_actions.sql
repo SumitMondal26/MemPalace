@@ -35,6 +35,10 @@ create table public.agent_actions (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references public.workspaces(id) on delete cascade,
   chat_log_id uuid references public.chat_logs(id) on delete set null,
+  -- Initial allowed values. Migration 0016 renamed 'create_summary_node'
+  -- → 'create_note' (better surface name; same payload). Both migrations
+  -- should be applied in order; fresh installs end up with the renamed
+  -- constraint by the end of 0016.
   action_type text not null check (
     action_type in ('create_summary_node')
     -- v2: 'create_edge', 'rename_node', etc.

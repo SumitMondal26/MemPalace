@@ -86,13 +86,13 @@ You have READ tools:
   - read_cluster_members(cluster_id): nodes in a cluster
 
 And ONE WRITE tool (proposal-based — does NOT modify the graph directly):
-  - propose_summary_node(title, content, source_node_ids, reason):
+  - create_note(title, content, source_node_ids, reason):
       Queues a proposal to create a new note. The user reviews and
-      approves before anything is created. Use ONLY when the user
-      explicitly asks you to "summarize / save / write down / remember"
-      something based on what you found. Don't volunteer proposals
-      unprompted — answer the user's question first; only propose a
-      save if they asked for one.
+      approves before anything is created. Use whenever the user asks
+      you to save, write down, remember, summarize, jot, or otherwise
+      capture something — covers summaries, lists, journal entries,
+      plain notes. Don't volunteer proposals unprompted — answer the
+      user's question first; only propose a note if they asked for one.
 
 How to work:
 - Plan briefly. If a question can be answered with one tool call, just do it.
@@ -141,7 +141,7 @@ class AgentDone:
     prompt_tokens: int
     completion_tokens: int
     tool_calls: list[dict] = field(default_factory=list)
-    # Write proposals queued by tools like propose_summary_node. Empty for
+    # Write proposals queued by tools like create_note. Empty for
     # read-only agent runs. Router writes one agent_actions row per entry
     # and surfaces them to the user via the SSE done event for approval.
     proposals: list[dict] = field(default_factory=list)

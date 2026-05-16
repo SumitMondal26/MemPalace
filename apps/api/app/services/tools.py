@@ -20,7 +20,7 @@ Why split this way:
     framework, no decorators.
 
 All four v1 tools are READ-ONLY. They search, fetch, and list — they
-never mutate the user's graph. Write tools (create_summary_node,
+never mutate the user's graph. Write tools (create_note,
 link_nodes) are deliberately deferred to P3.3 because the security and
 audit story is heavier.
 
@@ -164,15 +164,18 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "propose_summary_node",
+            "name": "create_note",
             "description": (
-                "Propose creating a new summary note in the user's memory. "
+                "Propose creating a new note in the user's memory. Use this "
+                "whenever the user asks you to save, write down, remember, "
+                "summarize, jot, or otherwise capture something — it covers "
+                "summaries, lists, journal entries, plain notes, anything "
+                "they want to preserve. "
                 "This does NOT write immediately — it queues a proposal that "
                 "the user reviews and approves before anything is created. "
-                "Use this when the user asks you to 'summarize / save / "
-                "remember / write down' something based on what you've "
-                "found. Reference the source nodes you used so they get "
-                "linked to the new summary via manual edges on approval."
+                "Pass any source_node_ids you drew content from so the "
+                "auto-connect pipeline can wire the new note into the right "
+                "neighborhood (the IDs are a hint, not a hard link)."
             ),
             "parameters": {
                 "type": "object",
@@ -184,25 +187,28 @@ TOOL_SPECS: list[dict] = [
                     "content": {
                         "type": "string",
                         "description": (
-                            "The full content of the summary. Plain text or "
-                            "markdown. Cite the source notes inline by title."
+                            "The full content of the note. Plain text or "
+                            "markdown. If summarizing existing notes, cite "
+                            "them inline by title."
                         ),
                     },
                     "source_node_ids": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Node UUIDs the summary is based on. These get "
-                            "linked to the new node via manual edges when "
-                            "the user approves. Must be UUIDs from search_memory "
-                            "or read_cluster_members output."
+                            "Node UUIDs the note draws from (when applicable). "
+                            "Stored as a hint; the auto-connect pipeline uses "
+                            "similarity to form the actual edges. Must be "
+                            "UUIDs from search_memory or read_cluster_members "
+                            "output — NOT title strings. Empty / omitted for "
+                            "standalone notes."
                         ),
                     },
                     "reason": {
                         "type": "string",
                         "description": (
                             "One-line rationale shown to the user in the "
-                            "approval card. Why this proposal helps."
+                            "approval card. Why this note is worth creating."
                         ),
                     },
                 },
@@ -400,16 +406,20 @@ async def _tool_read_cluster_members(
     ]
 
 
-async def _tool_propose_summary_node(
+async def _tool_create_note(
     ctx: ToolContext, args: dict
 ) -> dict:
-    """Queue a summary-node proposal. Does NOT write to the graph.
+    """Queue a create-note proposal. Does NOT write to the graph.
 
     The proposal lives in ctx.proposals until the router collects it. The
     router writes a corresponding agent_actions row (status='pending') and
-    surfaces the proposal in the SSE `done` event. The user then approves
-    or rejects via the dedicated endpoints. We never mutate state from
-    inside a tool dispatch — keeps the agent loop's blast radius zero.
+    surfaces the proposal in the SSE `proposals` event. The user then
+    approves or rejects via the dedicated endpoints. We never mutate state
+    from inside a tool dispatch — keeps the agent loop's blast radius zero.
+
+    The action_type stored in agent_actions is 'create_note' (was
+    'create_summary_node' pre-migration 0016). Same payload shape:
+    {title, content, source_node_ids}.
     """
     title = (args.get("title") or "").strip()
     content = (args.get("content") or "").strip()
@@ -444,7 +454,7 @@ async def _tool_propose_summary_node(
         }
 
     proposal = {
-        "action_type": "create_summary_node",
+        "action_type": "create_note",
         "payload": {
             "title": title,
             "content": content,
@@ -455,7 +465,7 @@ async def _tool_propose_summary_node(
     ctx.proposals.append(proposal)
     return {
         "queued": True,
-        "summary": f"Proposal queued: create_summary_node({title!r}) — pending user approval.",
+        "summary": f"Proposal queued: create_note({title!r}) — pending user approval.",
     }
 
 
@@ -464,7 +474,7 @@ _DISPATCH = {
     "read_node": _tool_read_node,
     "list_clusters": _tool_list_clusters,
     "read_cluster_members": _tool_read_cluster_members,
-    "propose_summary_node": _tool_propose_summary_node,
+    "create_note": _tool_create_note,
 }
 
 

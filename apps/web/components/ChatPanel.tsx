@@ -80,7 +80,7 @@ type AgentStep =
  *  approves/rejects via /agent/proposals/{id}/{approve|reject}. */
 type AgentProposal = {
   id: string;
-  action_type: "create_summary_node";
+  action_type: "create_note";
   payload: {
     title?: string;
     content?: string;
@@ -1044,7 +1044,7 @@ function ProposalRow({
         className="flex w-full items-center justify-between text-left"
       >
         <span className="truncate">
-          <span className="text-violet-300">create_summary_node</span>
+          <span className="text-violet-300">create_note</span>
           <span className="ml-2 text-neutral-200">
             {proposal.payload.title || "(untitled)"}
           </span>

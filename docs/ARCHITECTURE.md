@@ -188,7 +188,7 @@ Tools available to the model (read-only in P3.1):
 | `list_clusters()` | clusters + nodes count via IN-query | [{cluster_id, label, member_count}, ...] |
 | `read_cluster_members(cluster_id)` | nodes filtered by cluster_id (capped 50 rows) | [{node_id, title, type}, ...] |
 
-Write tools (`create_summary_node`, `link_nodes`) are deferred to P3.3 — the audit/confirmation/undo story is heavier than P3.1's read-only scope.
+Write tools (`create_note` shipped in P3.3; `link_nodes` deferred to v2) — gated behind the propose-then-approve pipeline (ADR-022).
 
 ## Data flow: agentic topic clustering (Recompute topics)
 
