@@ -80,6 +80,88 @@ Architecture Decision Records, kept lightweight. Each entry: **Context** (why we
 
 ---
 
+## ADR-022 — Agent write tools via propose-then-approve (P3.3)
+
+**Date:** 2026-05-16
+
+**Context.** P3.1/P3.2 shipped read-only agents. The natural next step is letting the agent *write* — `create_summary_node` (turn a cluster of findings into a permanent note), `link_nodes` (manual edges), eventually rename/delete. The moment an LLM can mutate state, the design has to answer four questions: visibility (what's about to happen?), approval (who decides?), audit (what was done?), undo (recover from mistakes).
+
+The naive shape is "agent writes immediately; we add a server-side allow-list of safe operations." It doesn't work — an autonomous agent can still write 17 nodes a minute, none of which the user wanted. Without explicit user approval the system becomes user-hostile.
+
+**Decision.** Write tools never write. They *declare intent* via a separate proposal lifecycle:
+
+```
+agent loop (read-only dispatch)
+   ↓
+propose_summary_node(title, content, source_node_ids, reason)
+   → records {action_type, payload, reason} in ToolContext.proposals
+   → returns {queued: true, summary: "..."} to the agent
+agent loop continues, can propose more
+   ↓
+agent loop ends → router collects ctx.proposals
+   ↓
+INSERT agent_actions rows with status='pending'
+   ↓
+SSE `proposals` event with [{id, action_type, payload, reason, attempt}, ...]
+   ↓
+UI renders an approval card with per-row [Approve] [Reject]
+   ↓
+user clicks → POST /agent/proposals/{id}/{approve|reject}
+   → approve: insert node + manual edges, set status='executed', result_node_id=new
+   → reject: set status='rejected'
+   → refetch graph in store, canvas updates
+```
+
+**v1 scope (deliberately small):**
+- ONE write tool: `propose_summary_node`. Creates a `note` node + manual edges from the new node to each `source_node_ids` entry.
+- Audit table `agent_actions` — pending/executed/rejected lifecycle, FK to chat_logs (`chat_log_id`) and to the created node (`result_node_id` on delete set null).
+- Two endpoints — `POST /agent/proposals/{id}/approve` and `…/reject`. Both 404 if the row isn't `status='pending'` (idempotent at the status level — no double-execute, no re-reject).
+- UI proposals card in the chat panel with per-row approve/reject. After approval the graph refetches and the new node appears in the canvas.
+- No undo button. The existing sidebar delete affordance is the undo (audit row's `result_node_id` becomes NULL via FK on delete).
+- No "trust this agent for the session" — approval is per-proposal, every time.
+
+**Why propose-then-approve (vs mid-loop modal pause):**
+- Server-side agent loop doesn't have to pause/wait for browser approval. No websockets, no polling, no half-complete agent runs hanging on user input.
+- All proposals shown together — user reviews + approves the batch in one card instead of N modals.
+- The audit trail has a clean lifecycle (pending → executed/rejected). State is recoverable; the agent loop is pure.
+- Reflection (P3.2) keeps working — proposals are snapshotted from `ToolContext.proposals` and cleared on each agent attempt so retries don't carry stale proposals forward.
+
+**RLS + double-spend guard.** RLS workspace-scopes `agent_actions` reads/writes. The approve/reject endpoints additionally enforce `eq('status', 'pending')` in the SELECT — re-approving an already-executed proposal returns 404 rather than re-creating the node. Idempotency at the status-machine level rather than via request dedup.
+
+**Cost shape.** Write tools cost the same as any other tool dispatch (one OpenAI iteration each). The execution itself is one or two DB inserts (node + edges), no LLM cost. Approval is a regular POST, no LLM.
+
+**Consequence.**
+- Pro: First-class "agent acts" without sacrificing user control. Every write is the user's explicit choice.
+- Pro: Audit trail is durable + queryable. `/insights` can later show "agent has proposed N writes, M approved, K rejected" + identify rogue patterns.
+- Pro: Adding a new write tool is two changes (tool schema + dispatch entry) — same shape as adding a read tool. The approval pipeline is reusable; `action_type='create_edge'` would slot right in.
+- Pro: Architecture survives growth. P3.4 (memory agent) and P3.5 (research agent) both write via this same mechanism.
+- Con: Latency on approval — user sees the card, has to click, then waits for the POST. Acceptable; the alternative (server pause + websocket) is much more code.
+- Con: Created node carries metadata `created_by: "agent"` + `agent_action_id`, but the canvas doesn't yet visually differentiate agent-created nodes. Visual signal would be useful at scale. Deferred.
+- Con: No "edit before approve" — user can only approve or reject the proposal as-is. If the agent's summary is 90% right, the user has to approve then edit in the sidebar after. Acceptable for v1.
+- Con: Reflection retry can produce proposals, but a retried agent's proposals get the same approval treatment as a first-attempt's — there's no "rejected proposals influence the retry." Could be future work if a pattern emerges.
+
+**Future work.**
+- `propose_edge(source_id, target_id, weight)` — connect two existing nodes.
+- `propose_node_update(node_id, content_patch)` — let the agent suggest amendments to existing notes.
+- "Approve all (matching pattern)" batch UX when proposals are numerous.
+- Visual differentiation for agent-created nodes (different glow, badge in sidebar).
+- `agent_actions` analytics on /insights — propose-approve rate, time-to-decision, most-common rejected proposals.
+
+### Amendment (same-day, audit-driven) — approve handler mirrors note-save chain
+
+**Context.** First real approval surfaced three problems in the v1 approve handler:
+1. It inserted `kind='manual'` edges from the new node to `source_node_ids`. Manual edges are reserved for user-drawn connections; using them for agent-attributed links muddies the semantics of the graph.
+2. It didn't embed the new node — `0 chunks` meant `/chat` retrieval couldn't see the summary the agent had just created.
+3. (Already accepted as-is) Clustering wasn't recomputed, but that's consistent with the note-save flow which requires the user to click Recompute Topics.
+
+**Decision.** Approve handler now mirrors the note-save chain used by the UI: **insert node → embed (chunk + embed_batch + INSERT chunks) → rebuild_semantic_edges RPC**. The agent's `source_node_ids` become a *hint* stored in `metadata.source_node_ids_hint` (audit trail of what the agent thought was relevant) but they do NOT create direct edges. The semantic-edge pipeline decides neighbors based on actual similarity — if the agent's hints were correct, those edges will form naturally with proper weights.
+
+**Why.** Manual edges drawn by the agent collapse two distinct concepts ("user manually connected these" vs "system inferred these"). Forcing the agent's writes through the same auto-connect pipeline as user notes keeps the data model coherent — the only difference between an agent-created note and a user note is the `metadata.created_by='agent'` flag.
+
+**Cost.** One extra embed call (~$0.0001 for a typical summary) + one extra `rebuild_semantic_edges` SQL call. Same cost as a manual note save. Worth it.
+
+---
+
 ## ADR-021 — Reflection loop (LLM-as-judge with bounded retry) — P3.2
 
 **Date:** 2026-05-16

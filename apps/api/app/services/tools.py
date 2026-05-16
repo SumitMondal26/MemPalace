@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -160,6 +160,56 @@ TOOL_SPECS: list[dict] = [
             },
         },
     },
+    # ----- WRITE tools (proposals only; user must approve before they execute) -----
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_summary_node",
+            "description": (
+                "Propose creating a new summary note in the user's memory. "
+                "This does NOT write immediately — it queues a proposal that "
+                "the user reviews and approves before anything is created. "
+                "Use this when the user asks you to 'summarize / save / "
+                "remember / write down' something based on what you've "
+                "found. Reference the source nodes you used so they get "
+                "linked to the new summary via manual edges on approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title for the new note (≤ 80 chars).",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "The full content of the summary. Plain text or "
+                            "markdown. Cite the source notes inline by title."
+                        ),
+                    },
+                    "source_node_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Node UUIDs the summary is based on. These get "
+                            "linked to the new node via manual edges when "
+                            "the user approves. Must be UUIDs from search_memory "
+                            "or read_cluster_members output."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "One-line rationale shown to the user in the "
+                            "approval card. Why this proposal helps."
+                        ),
+                    },
+                },
+                "required": ["title", "content"],
+            },
+        },
+    },
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOL_SPECS}
@@ -176,6 +226,11 @@ class ToolContext:
     sb_user: Client
     openai: AsyncOpenAI
     workspace_id: str
+    # Proposals queue for write tools (P3.3). Write tools don't write to the
+    # graph directly — they append a dict here. The router collects this
+    # list at the end of the agent loop and surfaces the proposals to the
+    # user for approval. Empty for read-only agent runs.
+    proposals: list[dict] = field(default_factory=list)
 
 
 # Result size caps — every dispatch return MUST stay under these. The LLM's
@@ -345,11 +400,71 @@ async def _tool_read_cluster_members(
     ]
 
 
+async def _tool_propose_summary_node(
+    ctx: ToolContext, args: dict
+) -> dict:
+    """Queue a summary-node proposal. Does NOT write to the graph.
+
+    The proposal lives in ctx.proposals until the router collects it. The
+    router writes a corresponding agent_actions row (status='pending') and
+    surfaces the proposal in the SSE `done` event. The user then approves
+    or rejects via the dedicated endpoints. We never mutate state from
+    inside a tool dispatch — keeps the agent loop's blast radius zero.
+    """
+    title = (args.get("title") or "").strip()
+    content = (args.get("content") or "").strip()
+    source_ids = args.get("source_node_ids") or []
+    reason = (args.get("reason") or "").strip()
+
+    if not title:
+        return {"error": "title is required"}
+    if not content:
+        return {"error": "content is required"}
+    if len(title) > 200:
+        return {"error": "title too long (max 200 chars)"}
+    # Validate source ids look like UUIDs — cheap guard against the
+    # label-vs-uuid confusion we saw with cluster_id in P3.1 audit.
+    cleaned_sources: list[str] = []
+    bad_ids: list[str] = []
+    for sid in source_ids:
+        if not isinstance(sid, str):
+            bad_ids.append(repr(sid))
+            continue
+        if _UUID_RE.match(sid.strip()):
+            cleaned_sources.append(sid.strip())
+        else:
+            bad_ids.append(sid)
+    if bad_ids:
+        return {
+            "error": (
+                f"source_node_ids contained non-UUID values: {bad_ids[:3]}. "
+                f"Each must be a node UUID from search_memory or "
+                f"read_cluster_members."
+            ),
+        }
+
+    proposal = {
+        "action_type": "create_summary_node",
+        "payload": {
+            "title": title,
+            "content": content,
+            "source_node_ids": cleaned_sources,
+        },
+        "reason": reason,
+    }
+    ctx.proposals.append(proposal)
+    return {
+        "queued": True,
+        "summary": f"Proposal queued: create_summary_node({title!r}) — pending user approval.",
+    }
+
+
 _DISPATCH = {
     "search_memory": _tool_search_memory,
     "read_node": _tool_read_node,
     "list_clusters": _tool_list_clusters,
     "read_cluster_members": _tool_read_cluster_members,
+    "propose_summary_node": _tool_propose_summary_node,
 }
 
 

@@ -43,6 +43,9 @@ const MANUAL_EDGE_COLOR = "#3b3d52";
 // visually recede. Aligned to palace-edge so it reads as "structural".
 const DIMMED_NODE_COLOR = "#1f2230";
 const DIMMED_LINK_COLOR = "#15171f";
+// Glow color for the most-recently-created node. Bright amber/gold so it
+// reads as "fresh" regardless of cluster color underneath.
+const NEWEST_NODE_COLOR = "#fde047";  // yellow-300
 
 /** Resolve a link endpoint id whether the lib has hydrated it to a node
  *  reference (post-sim) or kept it as a raw id string (pre-sim / pre-render). */
@@ -289,6 +292,55 @@ export default function GraphCanvas({
     return c ? new Set(c.members) : null;
   }, [focusedClusterId, clusterIndex]);
 
+  // The single most-recently-created node, by `created_at` desc. Gets a
+  // glowing amber render so the user can spot the node they just added.
+  // Stays "newest" until a newer node arrives — no time-fade in v1.
+  const newestNodeId = useMemo<string | null>(() => {
+    if (dbNodes.length === 0) return null;
+    let newest = dbNodes[0];
+    for (const n of dbNodes) {
+      if (n.created_at > newest.created_at) newest = n;
+    }
+    return newest.id;
+  }, [dbNodes]);
+
+  // Radial-gradient texture used for the halo sprite around the newest
+  // node. Built once via a canvas — bright amber center fading to fully
+  // transparent at the edge. Combined with AdditiveBlending in the
+  // SpriteMaterial below, this reads as a neon "bloom" on the dark bg
+  // without needing a postprocessing pass on the renderer.
+  const haloTexture = useMemo(() => {
+    if (typeof document === "undefined") return null;       // SSR guard
+    const size = 256;
+    const cnv = document.createElement("canvas");
+    cnv.width = size;
+    cnv.height = size;
+    const ctx = cnv.getContext("2d");
+    if (!ctx) return null;
+    const grad = ctx.createRadialGradient(
+      size / 2,
+      size / 2,
+      0,
+      size / 2,
+      size / 2,
+      size / 2,
+    );
+    // Color stops tuned so the center reads as a tight bright core and
+    // the falloff is long + soft (no hard edge). Amber rgb(253, 224, 71).
+    // Soft amber halo. Additive blending on a dark canvas effectively
+    // doubles these alphas — keep them modest so the glow reads as
+    // "highlight" rather than "sun."
+    grad.addColorStop(0.0, "rgba(253, 224, 71, 0.75)");
+    grad.addColorStop(0.55, "rgba(253, 224, 71, 0.55)");
+    grad.addColorStop(0.9, "rgba(253, 224, 71, 0.1)");
+    grad.addColorStop(1.0, "rgba(253, 224, 71, 0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    const tex = new THREE.CanvasTexture(cnv);
+    tex.minFilter = THREE.LinearFilter;
+    return tex;
+  }, []);
+
   const data = useMemo(() => {
     const titleById = new Map<string, string>();
     for (const n of dbNodes) titleById.set(n.id, n.title || "(untitled)");
@@ -368,13 +420,76 @@ export default function GraphCanvas({
         nodeRelSize={6}
         nodeOpacity={0.9}
         nodeResolution={20}
-        nodeVal={(n: GNode) => (n.id === selectedNodeId ? 12 : 6)}
+        // Glow halo around the newest node. We REPLACE the lib's default
+        // mesh (no nodeThreeObjectExtend) with a Group containing our own
+        // sphere + an additively-blended halo sprite — so the per-tick
+        // nodePositionUpdate callback moves both together as one unit.
+        // With extend=true the sprite stayed at the d3-force initial
+        // position while the sphere oscillated away — looked like two
+        // separate nodes. One Group, one position.
+        nodeThreeObject={(n: GNode) => {
+          // Only the newest node gets a custom object. For everyone else
+          // return null → the lib renders its default sphere using our
+          // nodeColor/nodeVal callbacks.
+          //
+          // For the newest node we REPLACE the default (extend=false /
+          // unset) and return a single Group containing the sphere AND
+          // its halo sprite. Why replace vs extend: the lib's per-tick
+          // `nodePositionUpdate` only moves the default mesh — with
+          // extend=true our sprite would drift away from the moving
+          // sphere. One unified Group keeps everything at the same spot.
+          if (!haloTexture || n.id !== newestNodeId) return null;
+          const group = new THREE.Group();
+          // Sphere: match the look of nodeVal=14 + nodeRelSize=6 so the
+          // newest node visually reads as "bigger" without being absurd.
+          const sphere = new THREE.Mesh(
+            new THREE.SphereGeometry(14, 20, 20),
+            new THREE.MeshLambertMaterial({
+              color: NEWEST_NODE_COLOR,
+              transparent: true,
+              opacity: 0.95,
+              // emissive nudges self-lighting so the sphere stays bright
+              // even without scene lights hitting it.
+              emissive: NEWEST_NODE_COLOR,
+              emissiveIntensity: 0.45,
+            }),
+          );
+          group.add(sphere);
+          // Halo sprite — additive-blended, sized ~3.5× sphere radius.
+          // Soft glow, not a sun.
+          const halo = new THREE.Sprite(
+            new THREE.SpriteMaterial({
+              map: haloTexture,
+              transparent: true,
+              opacity: 0.75,
+              blending: THREE.AdditiveBlending,
+              depthWrite: false,
+            }),
+          );
+          halo.scale.set(50, 50, 1);
+          group.add(halo);
+          return group;
+        }}
+        nodeVal={(n: GNode) =>
+          n.id === selectedNodeId ? 12 : n.id === newestNodeId ? 14 : 6
+        }
         nodeColor={(n: GNode) => {
           if (n.id === selectedNodeId) return SELECTED_COLOR;
           // When a cluster is focused, dim non-members by returning a
           // near-background color. This is a stronger signal than tweaking
-          // opacity (which the lib only supports uniformly).
-          if (focusedMembers && !focusedMembers.has(n.id)) return DIMMED_NODE_COLOR;
+          // opacity (which the lib only supports uniformly). Newest node
+          // is exempt — its glow should be visible even during focus.
+          if (
+            focusedMembers &&
+            !focusedMembers.has(n.id) &&
+            n.id !== newestNodeId
+          ) {
+            return DIMMED_NODE_COLOR;
+          }
+          // Glow color for the most-recently-created node beats cluster
+          // color — the "this is new" signal trumps the "this belongs to
+          // topic X" signal until the user adds another node.
+          if (n.id === newestNodeId) return NEWEST_NODE_COLOR;
           // Cluster color wins over type color when the node belongs to a
           // cluster (size >= 2 of weight-thresholded semantic neighbors).
           // Singletons fall back to type-color so the canvas doesn't go drab.

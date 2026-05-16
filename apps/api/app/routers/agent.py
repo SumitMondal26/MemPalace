@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 from supabase import Client
 
 from ..config import settings
-from ..deps import openai_client, supabase_user
+from ..deps import openai_client, supabase_admin, supabase_user
 from ..services.agent import (
     AgentDone,
     AgentFinalAnswer,
@@ -53,6 +53,8 @@ from ..services.agent import (
     AgentToolResult,
     run_agent,
 )
+from ..services.chunking import chunk_text, prepare_for_embedding
+from ..services.embeddings import embed_batch
 from ..services.reflection import build_retry_feedback, reflect_on_answer
 from ..services.tools import ToolContext
 
@@ -133,6 +135,11 @@ async def agent(
         prompt_tokens_total = 0
         completion_tokens_total = 0
         tool_call_log: list[dict] = []
+        # Write proposals queued by tools during the agent loop. We collect
+        # them here, persist as agent_actions rows AFTER the chat_logs row
+        # lands (need its id for the FK), and surface their ids in the
+        # `done` event so the UI can render approval cards.
+        proposals_accum: list[dict] = []
 
         # Reflection state — None when the judge didn't run (feature off /
         # no first-attempt answer).
@@ -158,6 +165,7 @@ async def agent(
             nonlocal iterations_total, hit_cap
             nonlocal prompt_tokens_total, completion_tokens_total
             nonlocal tool_call_log
+            nonlocal proposals_accum
 
             async for evt in run_agent(
                 openai, ctx, attempt_question, attempt_history
@@ -209,6 +217,11 @@ async def agent(
                     for entry in evt.tool_calls:
                         entry["attempt"] = attempt_label
                         tool_call_log.append(entry)
+                    # Tag each proposal with which attempt produced it so
+                    # /insights can replay agent thinking across retries.
+                    for p in evt.proposals:
+                        p["attempt"] = attempt_label
+                        proposals_accum.append(p)
 
         # --- First attempt ---
         yield _sse("stage", {"label": "Agent reasoning", "elapsed_ms": ms()})
@@ -327,22 +340,10 @@ async def agent(
             settings.openai_chat_model, prompt_tokens, completion_tokens
         )
 
-        yield _sse(
-            "done",
-            {
-                "elapsed_ms": total_ms,
-                "iterations": iterations,
-                "hit_iter_cap": hit_cap,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "reflection_score": reflection_score,
-                "reflection_score_first": reflection_score_first,
-                "reflection_retried": reflection_retried,
-                "cost_usd": round(cost_usd, 6),
-            },
-        )
-
         # Persist for /insights. Best-effort — never break the stream.
+        # We do this BEFORE the `done` SSE event so we can include the
+        # chat_log id in the agent_actions rows (and surface the action
+        # ids to the UI via the `proposals` event).
         log_row = {
             "workspace_id": workspace_id,
             "question": body.question,
@@ -374,10 +375,67 @@ async def agent(
             "reflection_retried": reflection_retried,
             "reflection_issues": reflection_issues or None,
         }
+        chat_log_id: str | None = None
         try:
-            sb_user.table("chat_logs").insert(log_row).execute()
+            log_result = (
+                sb_user.table("chat_logs").insert(log_row).execute()
+            )
+            if log_result.data:
+                chat_log_id = log_result.data[0]["id"]
         except Exception:
             pass
+
+        # Persist write proposals as agent_actions rows (status='pending').
+        # Emit a `proposals` SSE event so the UI can render approval cards
+        # with the real action ids the approve/reject endpoints accept.
+        surfaced_proposals: list[dict] = []
+        if proposals_accum:
+            action_rows = [
+                {
+                    "workspace_id": workspace_id,
+                    "chat_log_id": chat_log_id,
+                    "action_type": p["action_type"],
+                    "payload": p["payload"],
+                    "reason": p.get("reason") or None,
+                    "status": "pending",
+                }
+                for p in proposals_accum
+            ]
+            try:
+                action_result = (
+                    sb_user.table("agent_actions").insert(action_rows).execute()
+                )
+                for row, p in zip(action_result.data or [], proposals_accum):
+                    surfaced_proposals.append(
+                        {
+                            "id": row["id"],
+                            "action_type": row["action_type"],
+                            "payload": row["payload"],
+                            "reason": row.get("reason"),
+                            "attempt": p.get("attempt"),
+                        }
+                    )
+            except Exception:
+                pass
+
+        if surfaced_proposals:
+            yield _sse("proposals", {"items": surfaced_proposals})
+
+        yield _sse(
+            "done",
+            {
+                "elapsed_ms": total_ms,
+                "iterations": iterations,
+                "hit_iter_cap": hit_cap,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "reflection_score": reflection_score,
+                "reflection_score_first": reflection_score_first,
+                "reflection_retried": reflection_retried,
+                "proposals_count": len(surfaced_proposals),
+                "cost_usd": round(cost_usd, 6),
+            },
+        )
 
     return StreamingResponse(
         generate(),
@@ -388,3 +446,205 @@ async def agent(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Proposal approve / reject — P3.3 write gate.
+#
+# The agent's write tools (propose_summary_node, etc.) don't mutate the
+# graph. They queue agent_actions rows with status='pending'. These two
+# endpoints transition status and (on approve) perform the actual write.
+#
+# Workspace ownership enforced via RLS — the user's JWT auth-cookied
+# supabase client can only read/update agent_actions in workspaces they
+# own. The .eq('id', ...) + .eq('status', 'pending') guards prevent
+# re-approving an already-handled proposal (double-spend protection).
+# ---------------------------------------------------------------------------
+
+
+class ProposalResultResponse(BaseModel):
+    id: str
+    status: str            # 'executed' | 'rejected'
+    result_node_id: str | None = None
+    detail: str | None = None
+
+
+@router.post(
+    "/agent/proposals/{action_id}/approve",
+    response_model=ProposalResultResponse,
+)
+async def approve_proposal(
+    action_id: str,
+    sb_user: Annotated[Client, Depends(supabase_user)],
+    sb_admin: Annotated[Client, Depends(supabase_admin)],
+    openai: Annotated[AsyncOpenAI, Depends(openai_client)],
+) -> ProposalResultResponse:
+    """Execute a pending proposal. Mirrors the note-save chain used by the
+    UI: insert node → embed content → rebuild semantic edges via the kNN
+    pipeline. Semantic edges (not manual) — they let the auto-connect logic
+    decide neighbors based on actual similarity, same as every user-created
+    note. The agent's `source_node_ids` are a *hint*, not a hard link;
+    if they're truly related the semantic edges will form.
+
+    Idempotent at the status level — re-approving a non-pending row 404s."""
+    from fastapi import HTTPException, status as http_status
+
+    # 1. Fetch + double-check it's pending. RLS makes this user-scoped.
+    row = (
+        sb_user.table("agent_actions")
+        .select("*")
+        .eq("id", action_id)
+        .eq("status", "pending")
+        .maybe_single()
+        .execute()
+    )
+    if not row or not row.data:
+        raise HTTPException(
+            http_status.HTTP_404_NOT_FOUND,
+            detail="proposal not found, not yours, or already handled",
+        )
+    action = row.data
+    payload = action.get("payload") or {}
+    workspace_id = action["workspace_id"]
+
+    # 2. Execute by action_type. Only one supported in v1.
+    if action["action_type"] != "create_summary_node":
+        raise HTTPException(
+            http_status.HTTP_400_BAD_REQUEST,
+            detail=f"unsupported action_type: {action['action_type']}",
+        )
+
+    # 2a. Insert the new node. Metadata flags it as agent-created + carries
+    #     the proposal id (for audit + future visual differentiation) +
+    #     the source_node_ids the agent thought were relevant (a *hint*
+    #     for users; not a hard graph link).
+    source_ids_hint = [
+        s for s in (payload.get("source_node_ids") or []) if isinstance(s, str) and s
+    ]
+    title = payload.get("title") or "Untitled summary"
+    content = (payload.get("content") or "").strip()
+
+    new_node_resp = (
+        sb_user.table("nodes")
+        .insert(
+            {
+                "workspace_id": workspace_id,
+                "type": "note",
+                "title": title,
+                "content": content,
+                "metadata": {
+                    "created_by": "agent",
+                    "agent_action_id": action_id,
+                    "source_node_ids_hint": source_ids_hint,
+                },
+            }
+        )
+        .execute()
+    )
+    if not new_node_resp.data:
+        raise HTTPException(
+            http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to insert summary node",
+        )
+    new_node = new_node_resp.data[0]
+    new_node_id = new_node["id"]
+
+    # 2b. Embed the new content. Without this the node has 0 chunks and is
+    #     invisible to /chat retrieval. Mirrors routers/nodes.embed_node:
+    #     prepare → chunk → embed_batch → INSERT chunks.
+    chunks_created = 0
+    if content:
+        cleaned = prepare_for_embedding(content)
+        if cleaned:
+            chunks = chunk_text(cleaned)
+            if chunks:
+                try:
+                    embeddings = await embed_batch(
+                        openai, [c.content for c in chunks]
+                    )
+                    chunk_rows = [
+                        {
+                            "node_id": new_node_id,
+                            "chunk_index": i,
+                            "content": c.content,
+                            "token_count": c.token_count,
+                            "embedding": emb,
+                        }
+                        for i, (c, emb) in enumerate(
+                            zip(chunks, embeddings, strict=True)
+                        )
+                    ]
+                    sb_admin.table("chunks").insert(chunk_rows).execute()
+                    chunks_created = len(chunk_rows)
+                except Exception:
+                    # Don't roll back the node — partial embed is recoverable
+                    # via the Reindex button in the sidebar.
+                    pass
+
+    # 2c. Rebuild semantic edges via the same kNN pipeline used by
+    #     auto-connect. Produces `kind='semantic'` edges with real similarity
+    #     weights — NOT manual edges (those are reserved for user-drawn
+    #     connections). If the agent's `source_node_ids_hint` were
+    #     genuinely related, those edges will form naturally.
+    try:
+        sb_user.rpc(
+            "rebuild_semantic_edges",
+            {"ws_id": str(workspace_id), "k_neighbors": 3, "min_weight": 0.25},
+        ).execute()
+    except Exception:
+        # Auto-connect failure shouldn't roll back the node either —
+        # user can re-run from the canvas.
+        pass
+
+    # 3. Transition the action row.
+    sb_user.table("agent_actions").update(
+        {
+            "status": "executed",
+            "executed_at": "now()",
+            "result_node_id": new_node_id,
+        }
+    ).eq("id", action_id).execute()
+
+    return ProposalResultResponse(
+        id=action_id,
+        status="executed",
+        result_node_id=new_node_id,
+        detail=(
+            f"Created node '{title}', indexed {chunks_created} chunk"
+            f"{'' if chunks_created == 1 else 's'}, rebuilt semantic edges."
+        ),
+    )
+
+
+@router.post(
+    "/agent/proposals/{action_id}/reject",
+    response_model=ProposalResultResponse,
+)
+async def reject_proposal(
+    action_id: str,
+    sb_user: Annotated[Client, Depends(supabase_user)],
+) -> ProposalResultResponse:
+    """Mark a pending proposal as rejected — no write happens. Idempotent
+    in the same sense as approve: pending → rejected is the only allowed
+    transition; everything else 404s."""
+    from fastapi import HTTPException, status as http_status
+
+    row = (
+        sb_user.table("agent_actions")
+        .select("id")
+        .eq("id", action_id)
+        .eq("status", "pending")
+        .maybe_single()
+        .execute()
+    )
+    if not row or not row.data:
+        raise HTTPException(
+            http_status.HTTP_404_NOT_FOUND,
+            detail="proposal not found, not yours, or already handled",
+        )
+
+    sb_user.table("agent_actions").update(
+        {"status": "rejected", "rejected_at": "now()"}
+    ).eq("id", action_id).execute()
+
+    return ProposalResultResponse(id=action_id, status="rejected")

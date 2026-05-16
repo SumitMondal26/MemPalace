@@ -52,7 +52,7 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [ ] **Recursive token-aware chunking** that respects markdown headings + paragraph boundaries.
 - [ ] **Redis + arq** — ingestion moves off the request path into background jobs.
 
-## P3 — Agents 🟡 ~40% shipped (P3.1 + P3.2)
+## P3 — Agents 🟡 ~60% shipped (P3.1 + P3.2 + P3.3)
 
 **Learning goal:** Tool-using agents, reflection loops, multi-step orchestration without LangChain.
 
@@ -64,11 +64,12 @@ Status legend: `[x]` = shipped · `[~]` = partial / in flight · `[ ]` = not sta
 - [x] **ChatPanel agent-mode toggle** — checkbox routes between `/chat` and `/agent`. Trace UI renders each tool call as a collapsible row (icon + name + args, click to expand args/result).
 - [x] **Iteration-cap behavior** — when hit, agent makes one final no-tools LLM call to force a summary. Amber chip in UI surfaces the cap-hit case.
 - [x] Migration `0012_chat_logs_agent` — adds is_agent / agent_iterations / agent_tool_calls / agent_hit_iter_cap.
-- [x] **Reflection loop (P3.2)** — `services/reflection.py` LLM-as-judge scores agent answer 1-5 on grounding + completeness; score < 4 + should_retry triggers ONE more agent attempt with rejected answer + judge feedback in the history. Cap at 1 retry (no ping-pong). New SSE `reflection` event; events tagged with `attempt: "first" | "retry"` for UI separation. Migration 0013 (reflection_score / reflection_retried / reflection_issues). UI: color-tiered chip (green→red) with expandable issues; "retry attempt" divider in the trace. ADR-021.
+- [x] **Reflection loop (P3.2)** — `services/reflection.py` LLM-as-judge scores agent answer 1-5 on grounding + completeness; score < 4 + should_retry triggers ONE more agent attempt with rejected answer + judge feedback in the history. **Audit-driven follow-up:** added a SECOND judge call after retry so the chip reflects the SHIPPED answer's score (not the rejected one's); ship max(scores). Migrations 0013 + 0014. ADR-021 (+ in-place amendment).
+- [x] **Bonus from P3.2:** `TODAY IS:` header prepended to both /chat and /agent system prompts. Validated live: agent correctly computed 107 days for "May 15 → Aug 30."
+- [x] **Write tools — P3.3 (propose-then-approve)** — `propose_summary_node` queues a proposal during the agent loop; user reviews + approves/rejects via per-row buttons in the chat panel; on approve, server inserts the node + manual edges back to source nodes. Migration 0015 (`agent_actions` table). Two endpoints `POST /agent/proposals/{id}/{approve|reject}` with status-pending guard for idempotency. SSE `proposals` event surfaces the persisted action ids to the UI. ADR-022.
 
 ### Remaining
-- [ ] **Write tools (P3.3)** — `create_summary_node`, `link_nodes` with confirmation UX, audit table, undo affordance. The "agent can mutate your graph" boundary.
-- [ ] **Memory agent (P3.4)** — autonomous curator. Runs from a button; later scheduled. Reviews clusters, proposes summary nodes.
+- [ ] **Memory agent (P3.4)** — autonomous curator. Runs from a button; later scheduled. Reviews clusters, proposes summary nodes via the P3.3 propose-then-approve pipeline.
 - [ ] **Research agent (P3.5)** — web fetch + search tools. Question expands the graph from external sources. Aggressive cost cap.
 - [ ] **Retrieval agent (variant)** — rewrites queries, decides between vector / fulltext / graph traversal. Could be a single specialized tool rather than a whole agent.
 

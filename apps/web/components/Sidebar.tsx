@@ -46,6 +46,7 @@ export default function Sidebar() {
   const selectNode = useGraphStore((s) => s.selectNode);
   const cancelDraft = useGraphStore((s) => s.cancelDraft);
   const setEdges = useGraphStore((s) => s.setEdges);
+  const applyClusters = useGraphStore((s) => s.applyClusters);
 
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
@@ -101,6 +102,36 @@ export default function Sidebar() {
     }
   }
 
+  /**
+   * Full post-save chain: rebuild semantic edges, then recompute clusters,
+   * then refresh both store slices in one atomic update so the canvas
+   * re-renders consistently. Used by every save trigger (edit / file upload /
+   * new node create) so agent-created nodes and user-created notes get
+   * identical post-save treatment.
+   *
+   * Cost: rebuild_semantic_edges is server-side SQL (~50ms).
+   * recompute-clusters does k-means (~50ms) + 1 LLM naming call per
+   * *changed* cluster — `members_hash` reuse means only the cluster the
+   * new node landed in gets re-named (~$0.0001, ~1s).
+   */
+  async function autoConnectChain(wsId: string) {
+    await api(`/workspaces/${wsId}/rebuild-edges`, { method: "POST" });
+    try {
+      await api(`/workspaces/${wsId}/recompute-clusters`, { method: "POST" });
+    } catch (e) {
+      // Cluster recompute is best-effort — semantic edges already updated.
+      // Worst case: user clicks Recompute Topics manually later.
+      console.warn("auto-recompute clusters failed", e);
+    }
+    const [freshNodes, freshEdges, freshClusters] = await Promise.all([
+      db.listNodes(wsId),
+      db.listEdges(wsId),
+      db.listClusters(wsId),
+    ]);
+    applyClusters(freshNodes, freshClusters);
+    setEdges(freshEdges);
+  }
+
   function indexNode(nodeId: string) {
     setIndexStatus("indexing");
     api<{ chunks_created: number }>(`/nodes/${nodeId}/embed`, {
@@ -109,15 +140,12 @@ export default function Sidebar() {
       .then(async (res) => {
         setIndexStatus("indexed");
         setChunkCount(res.chunks_created);
-        // Auto-connect once new chunks exist — keeps the graph fresh without
-        // requiring the user to remember to click the button.
+        // Auto-connect + recluster once new chunks exist — keeps the graph
+        // AND the topic legend fresh without requiring the user to click
+        // either button.
         if (node?.workspace_id) {
           try {
-            await api(`/workspaces/${node.workspace_id}/rebuild-edges`, {
-              method: "POST",
-            });
-            const fresh = await db.listEdges(node.workspace_id);
-            setEdges(fresh);
+            await autoConnectChain(node.workspace_id);
           } catch (e) {
             console.warn("auto-connect after embed failed", e);
           }
@@ -180,7 +208,6 @@ export default function Sidebar() {
           selectNode(newNode.id);
         }}
         onCancel={cancelDraft}
-        setEdges={setEdges}
       />
     );
   }
@@ -321,12 +348,7 @@ export default function Sidebar() {
                 await refreshState();
                 if (node.workspace_id) {
                   try {
-                    await api(
-                      `/workspaces/${node.workspace_id}/rebuild-edges`,
-                      { method: "POST" },
-                    );
-                    const fresh = await db.listEdges(node.workspace_id);
-                    setEdges(fresh);
+                    await autoConnectChain(node.workspace_id);
                   } catch (e) {
                     console.warn("auto-connect after ingest failed", e);
                   }
@@ -374,13 +396,11 @@ function DraftForm({
   workspaceId,
   onCreated,
   onCancel,
-  setEdges,
 }: {
   type: NodeType;
   workspaceId: string;
   onCreated: (n: db.DbNode) => void;
   onCancel: () => void;
-  setEdges: (edges: db.DbEdge[]) => void;
 }) {
   const copy = DRAFT_COPY[type];
   const [title, setTitle] = useState("");
@@ -389,6 +409,10 @@ function DraftForm({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const titleRef = useRef<HTMLInputElement | null>(null);
+  // Store actions pulled directly — no prop drilling. Mirrors the parent
+  // Sidebar's autoConnectChain (kept local for component independence).
+  const setEdges = useGraphStore((s) => s.setEdges);
+  const applyClusters = useGraphStore((s) => s.applyClusters);
 
   useEffect(() => {
     titleRef.current?.focus();
@@ -416,15 +440,31 @@ function DraftForm({
       });
       onCreated(node);
 
-      // Background: embed (if there's content) → auto-connect → refresh edges.
+      // Background chain: embed → auto-connect (semantic edges) →
+      // recompute clusters → refresh nodes/edges/clusters in the store.
+      // Same chain agent-created notes go through on approval (P3.3
+      // amendment) so user-created and agent-created notes are
+      // indistinguishable downstream.
       if ((type === "note" || type === "url") && assembledContent) {
         try {
           await api(`/nodes/${node.id}/embed`, { method: "POST" });
           await api(`/workspaces/${workspaceId}/rebuild-edges`, {
             method: "POST",
           });
-          const fresh = await db.listEdges(workspaceId);
-          setEdges(fresh);
+          try {
+            await api(`/workspaces/${workspaceId}/recompute-clusters`, {
+              method: "POST",
+            });
+          } catch (e) {
+            console.warn("auto-recompute clusters failed (non-fatal)", e);
+          }
+          const [freshNodes, freshEdges, freshClusters] = await Promise.all([
+            db.listNodes(workspaceId),
+            db.listEdges(workspaceId),
+            db.listClusters(workspaceId),
+          ]);
+          applyClusters(freshNodes, freshClusters);
+          setEdges(freshEdges);
         } catch (e) {
           console.warn("post-create embed/auto-connect failed", e);
         }

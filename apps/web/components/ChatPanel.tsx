@@ -2,6 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { api } from "@/lib/api";
+import * as db from "@/lib/db";
+import { useGraphStore } from "@/lib/store";
 import { supabase } from "@/lib/supabase";
 
 type Source = {
@@ -73,6 +76,25 @@ type AgentStep =
       attempt?: "first" | "retry";
     };
 
+/** A write-tool proposal returned by /agent. The user reviews each one and
+ *  approves/rejects via /agent/proposals/{id}/{approve|reject}. */
+type AgentProposal = {
+  id: string;
+  action_type: "create_summary_node";
+  payload: {
+    title?: string;
+    content?: string;
+    source_node_ids?: string[];
+  };
+  reason?: string | null;
+  attempt?: "first" | "retry";
+  /** Local UI state — not from the server. Tracks our optimistic transition
+   *  through approve/reject calls. */
+  uiStatus?: "pending" | "approving" | "approved" | "rejecting" | "rejected" | "error";
+  resultNodeId?: string | null;
+  errorDetail?: string;
+};
+
 type ReflectionInfo = {
   /** Score of the SHIPPED answer (max of first/retry when retry happened). */
   score: number;        // 1-5
@@ -115,6 +137,9 @@ type Message = {
    *  shows the first answer instead. Lets the trace UI explain why the
    *  visible answer doesn't match the last `final` event in time order. */
   shippedFirstAnswer?: boolean;
+  /** Write proposals queued by the agent. Each one is a `pending`
+   *  agent_actions row server-side until the user approves or rejects. */
+  proposals?: AgentProposal[];
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -127,6 +152,12 @@ export default function ChatPanel() {
   // Agent mode toggle. /chat = single-pass RAG (cheaper, faster).
   // /agent = multi-step LLM-tools loop (richer reasoning, ~3× cost & latency).
   const [agentMode, setAgentMode] = useState(false);
+  // Pulled from the store so we can refetch the graph after a proposal is
+  // approved (new node + edges appear in the 3D canvas immediately).
+  const workspaceId = useGraphStore((s) => s.workspaceId);
+  const upsertNode = useGraphStore((s) => s.upsertNode);
+  const setEdges = useGraphStore((s) => s.setEdges);
+  const selectNode = useGraphStore((s) => s.selectNode);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -263,6 +294,24 @@ export default function ChatPanel() {
     mutateLastAssistant((m) => ({ ...m, shippedFirstAnswer: true }));
   }
 
+  function setProposals(proposals: AgentProposal[]) {
+    mutateLastAssistant((m) => ({
+      ...m,
+      proposals: proposals.map((p) => ({ ...p, uiStatus: "pending" as const })),
+    }));
+  }
+
+  /** Mutate one proposal by id within the LATEST assistant message. The
+   *  proposals card is anchored there; older messages don't change. */
+  function updateProposal(id: string, patch: Partial<AgentProposal>) {
+    mutateLastAssistant((m) => ({
+      ...m,
+      proposals: (m.proposals ?? []).map((p) =>
+        p.id === id ? { ...p, ...patch } : p,
+      ),
+    }));
+  }
+
   function markDone(done: DoneInfo) {
     mutateLastAssistant((m) => ({ ...m, done }));
   }
@@ -331,6 +380,9 @@ export default function ChatPanel() {
       } else {
         setAgentMeta(p.iter_used, false);
       }
+    } else if (event === "proposals" && payload && typeof payload === "object") {
+      const p = payload as { items?: AgentProposal[] };
+      if (Array.isArray(p.items)) setProposals(p.items);
     } else if (event === "reflection" && payload && typeof payload === "object") {
       setReflection(payload as ReflectionInfo);
     } else if (event === "done" && payload && typeof payload === "object") {
@@ -406,6 +458,7 @@ export default function ChatPanel() {
               key={i}
               message={m}
               isStreaming={i === messages.length - 1 && loading}
+              onProposalUpdate={updateProposal}
             />
           ),
         )}
@@ -470,9 +523,11 @@ function UserBubble({ content }: { content: string }) {
 function AssistantTurn({
   message,
   isStreaming,
+  onProposalUpdate,
 }: {
   message: Message;
   isStreaming: boolean;
+  onProposalUpdate: (id: string, patch: Partial<AgentProposal>) => void;
 }) {
   const trace = message.trace ?? [];
   const isDone = message.done != null;
@@ -524,6 +579,13 @@ function AssistantTurn({
         />
       )}
 
+      {message.proposals && message.proposals.length > 0 && (
+        <ProposalsCard
+          proposals={message.proposals}
+          onUpdate={onProposalUpdate}
+        />
+      )}
+
       {message.rewrite?.was_rewritten && (
         <div
           className="rounded-md bg-cyan-950/40 px-2 py-1 text-[10px] text-cyan-200 ring-1 ring-cyan-900/60"
@@ -571,6 +633,8 @@ function AssistantTurn({
             ""
           ))}
       </div>
+
+      {message.content && isDone && <CopyButton text={message.content} />}
 
       {message.sources && message.sources.length > 0 && (
         <div className="space-y-2">
@@ -797,6 +861,240 @@ function AgentTrace({ steps }: { steps: AgentStep[] }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/**
+ * CopyButton — small affordance under the assistant bubble. Copies the
+ * full answer text to the clipboard. Brief inline confirmation; no toast,
+ * no global state. Hidden on mobile-keyboard focus to avoid jitter.
+ */
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  async function onClick() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API blocked (e.g. http context). Fall back silently —
+      // the user can still select+copy from the bubble.
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center gap-1 self-start rounded px-1.5 py-0.5 text-[10px] text-neutral-500 transition hover:bg-palace-bg/60 hover:text-neutral-300"
+      title={copied ? "Copied!" : "Copy answer to clipboard"}
+    >
+      <span aria-hidden="true">{copied ? "✓" : "📋"}</span>
+      <span>{copied ? "copied" : "copy"}</span>
+    </button>
+  );
+}
+
+/**
+ * ProposalsCard — rendered when the agent queued one or more write proposals.
+ * Each row shows the action's payload (title + content preview + reason)
+ * with [Approve] [Reject] buttons. On click, calls the corresponding
+ * endpoint and updates local UI state via onUpdate. After successful
+ * approval, also refreshes the graph store so the new node + edges
+ * appear in the canvas immediately.
+ *
+ * No undo button — the user can delete the created node via the sidebar
+ * if they change their mind. Audit row in agent_actions stays around.
+ */
+function ProposalsCard({
+  proposals,
+  onUpdate,
+}: {
+  proposals: AgentProposal[];
+  onUpdate: (id: string, patch: Partial<AgentProposal>) => void;
+}) {
+  const workspaceId = useGraphStore((s) => s.workspaceId);
+  const applyClusters = useGraphStore((s) => s.applyClusters);
+  const setEdges = useGraphStore((s) => s.setEdges);
+
+  /** After approval: refresh nodes + edges immediately (cheap), then kick
+   *  off cluster recompute in the background (slower; ~1s for the LLM
+   *  naming on the changed cluster). Done as a fire-and-forget chain so
+   *  the approve button transitions to "✓ created" without waiting on
+   *  clustering — the legend updates a beat later. */
+  async function refreshGraphAndRecluster() {
+    if (!workspaceId) return;
+    // Immediate: nodes + edges (server already ran rebuild_semantic_edges
+    // inside the approve handler).
+    try {
+      const [nodes, edges] = await Promise.all([
+        db.listNodes(workspaceId),
+        db.listEdges(workspaceId),
+      ]);
+      const clusters = await db.listClusters(workspaceId);
+      applyClusters(nodes, clusters);
+      setEdges(edges);
+    } catch {
+      // Non-fatal — the canvas will catch up on next page load.
+      return;
+    }
+    // Background: recompute clusters. Members_hash reuse keeps cost
+    // bounded (~$0.0001 for the 1-2 changed clusters).
+    try {
+      await api(`/workspaces/${workspaceId}/recompute-clusters`, {
+        method: "POST",
+      });
+      const [nodes, clusters] = await Promise.all([
+        db.listNodes(workspaceId),
+        db.listClusters(workspaceId),
+      ]);
+      applyClusters(nodes, clusters);
+    } catch {
+      // Cluster recompute failure is non-fatal; user can click
+      // Recompute Topics manually.
+    }
+  }
+
+  async function approve(id: string) {
+    onUpdate(id, { uiStatus: "approving" });
+    try {
+      const res = await api<{ id: string; status: string; result_node_id?: string }>(
+        `/agent/proposals/${id}/approve`,
+        { method: "POST" },
+      );
+      onUpdate(id, {
+        uiStatus: "approved",
+        resultNodeId: res.result_node_id ?? null,
+      });
+      await refreshGraphAndRecluster();
+    } catch (e) {
+      onUpdate(id, {
+        uiStatus: "error",
+        errorDetail: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  async function reject(id: string) {
+    onUpdate(id, { uiStatus: "rejecting" });
+    try {
+      await api(`/agent/proposals/${id}/reject`, { method: "POST" });
+      onUpdate(id, { uiStatus: "rejected" });
+    } catch (e) {
+      onUpdate(id, {
+        uiStatus: "error",
+        errorDetail: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg bg-violet-950/30 px-3 py-2 ring-1 ring-violet-900/60">
+      <div className="text-[9px] font-semibold uppercase tracking-wider text-violet-300">
+        🪄 Agent proposes {proposals.length} write{proposals.length === 1 ? "" : "s"} — your approval required
+      </div>
+      {proposals.map((p) => (
+        <ProposalRow
+          key={p.id}
+          proposal={p}
+          onApprove={() => approve(p.id)}
+          onReject={() => reject(p.id)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ProposalRow({
+  proposal,
+  onApprove,
+  onReject,
+}: {
+  proposal: AgentProposal;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const sourceCount = proposal.payload.source_node_ids?.length ?? 0;
+  const status = proposal.uiStatus ?? "pending";
+  const disabled =
+    status === "approving" ||
+    status === "rejecting" ||
+    status === "approved" ||
+    status === "rejected";
+
+  const statusBadge =
+    status === "approved" ? (
+      <span className="text-[10px] text-emerald-400">
+        ✓ created{proposal.resultNodeId ? "" : ""}
+      </span>
+    ) : status === "rejected" ? (
+      <span className="text-[10px] text-neutral-500">rejected</span>
+    ) : status === "approving" || status === "rejecting" ? (
+      <span className="text-[10px] text-neutral-400">{status}…</span>
+    ) : status === "error" ? (
+      <span className="text-[10px] text-red-400">error</span>
+    ) : null;
+
+  return (
+    <div className="rounded bg-palace-bg/60 px-2 py-1.5 text-[11px]">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center justify-between text-left"
+      >
+        <span className="truncate">
+          <span className="text-violet-300">create_summary_node</span>
+          <span className="ml-2 text-neutral-200">
+            {proposal.payload.title || "(untitled)"}
+          </span>
+          {sourceCount > 0 && (
+            <span className="ml-1 text-neutral-500">· {sourceCount} source{sourceCount === 1 ? "" : "s"}</span>
+          )}
+        </span>
+        <span className="ml-2 shrink-0 opacity-60">{expanded ? "▼" : "▶"}</span>
+      </button>
+      {expanded && (
+        <div className="mt-1 space-y-1 text-[10px] text-neutral-400">
+          {proposal.reason && (
+            <div>
+              <span className="text-neutral-500">why:</span> {proposal.reason}
+            </div>
+          )}
+          {proposal.payload.content && (
+            <div className="whitespace-pre-wrap rounded bg-palace-bg p-2 text-neutral-300">
+              {proposal.payload.content.slice(0, 600)}
+              {proposal.payload.content.length > 600 && "…"}
+            </div>
+          )}
+          {proposal.errorDetail && (
+            <div className="text-red-400">{proposal.errorDetail}</div>
+          )}
+        </div>
+      )}
+      <div className="mt-1.5 flex items-center justify-between">
+        {statusBadge ?? <span />}
+        {status === "pending" && (
+          <div className="flex gap-1">
+            <button
+              type="button"
+              onClick={onReject}
+              disabled={disabled}
+              className="rounded bg-neutral-800 px-2 py-0.5 text-[10px] text-neutral-300 hover:bg-neutral-700 disabled:opacity-50"
+            >
+              Reject
+            </button>
+            <button
+              type="button"
+              onClick={onApprove}
+              disabled={disabled}
+              className="rounded bg-emerald-700 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-emerald-600 disabled:opacity-50"
+            >
+              Approve
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

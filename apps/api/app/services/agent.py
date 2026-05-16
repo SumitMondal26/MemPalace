@@ -79,11 +79,20 @@ MAX_TOKENS_PER_ITER = 800
 
 AGENT_SYSTEM_PROMPT = """You are Mem Palace, an assistant that explores a user's personal memory graph.
 
-You have tools to search and read the user's memory:
+You have READ tools:
   - search_memory(query, k): semantic search returning chunks with node ids + previews
   - read_node(node_id): full content of one node
   - list_clusters(): all topic clusters in the workspace
   - read_cluster_members(cluster_id): nodes in a cluster
+
+And ONE WRITE tool (proposal-based — does NOT modify the graph directly):
+  - propose_summary_node(title, content, source_node_ids, reason):
+      Queues a proposal to create a new note. The user reviews and
+      approves before anything is created. Use ONLY when the user
+      explicitly asks you to "summarize / save / write down / remember"
+      something based on what you found. Don't volunteer proposals
+      unprompted — answer the user's question first; only propose a
+      save if they asked for one.
 
 How to work:
 - Plan briefly. If a question can be answered with one tool call, just do it.
@@ -92,6 +101,7 @@ How to work:
 - If your tools return nothing relevant, say so honestly. Do NOT invent facts.
 - Be concise. The user wants the answer, not a transcript of your reasoning.
 - When you have enough to answer, just answer — don't keep searching for completeness.
+- If you propose a write, your final answer should mention the proposal and tell the user it's awaiting their approval in the chat panel.
 """.strip()
 
 
@@ -131,6 +141,10 @@ class AgentDone:
     prompt_tokens: int
     completion_tokens: int
     tool_calls: list[dict] = field(default_factory=list)
+    # Write proposals queued by tools like propose_summary_node. Empty for
+    # read-only agent runs. Router writes one agent_actions row per entry
+    # and surfaces them to the user via the SSE done event for approval.
+    proposals: list[dict] = field(default_factory=list)
 
 
 AgentEvent = AgentToolCall | AgentToolResult | AgentFinalAnswer | AgentDone
@@ -289,10 +303,17 @@ async def run_agent(
         final_content = (forced.choices[0].message.content or "").strip()
 
     yield AgentFinalAnswer(content=final_content, iter_used=iters_used)
+    # Snapshot the proposals at the end of the loop. They were appended
+    # by write-tool dispatch into the shared ToolContext during the run;
+    # we hand them off to the router, then clear so a re-entered attempt
+    # (P3.2 reflection retry) starts with an empty queue.
+    proposals_snapshot = list(ctx.proposals)
+    ctx.proposals.clear()
     yield AgentDone(
         iterations=iters_used,
         hit_iter_cap=hit_cap,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
         tool_calls=tool_call_log,
+        proposals=proposals_snapshot,
     )
