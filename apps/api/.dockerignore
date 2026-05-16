@@ -1,0 +1,36 @@
+# Keep the Docker build context lean — every file COPY'd is read into the
+# image layer cache and shipped to the registry. Excluding venvs, caches,
+# and the eval harness shaves ~hundreds of MB off the upload and makes
+# Render builds faster.
+
+# Python runtime detritus
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtualenvs (anyone might have a .venv locally; never ship it)
+.venv/
+venv/
+env/
+
+# Eval harness — local-only golden set + outputs, not needed at runtime
+eval/
+
+# IDE / OS noise
+.vscode/
+.idea/
+.DS_Store
+
+# Local env files (Render injects env via dashboard, never via file)
+.env
+.env.*
+!.env.example
+
+# Git
+.git/
+.gitignore

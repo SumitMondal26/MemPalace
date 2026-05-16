@@ -21,4 +21,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Shell-form CMD so $PORT expands at container start. Render assigns the
+# external port via the $PORT env var; locally docker-compose maps 8000
+# explicitly and PORT is unset, so the :-8000 default kicks in.
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
